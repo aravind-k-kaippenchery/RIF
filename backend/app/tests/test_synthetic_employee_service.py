@@ -38,3 +38,11 @@ def test_synthetic_prompt_requires_explicit_count():
         assert exc.code == "synthetic_employee_count_required"
     else:
         raise AssertionError("Expected a controlled count-required error.")
+
+def test_parse_add_ten_workers_randomly():
+    request = parse_synthetic_employee_prompt(
+        "add 10 workers randomly"
+    )
+
+    assert request is not None
+    assert request.count == 10

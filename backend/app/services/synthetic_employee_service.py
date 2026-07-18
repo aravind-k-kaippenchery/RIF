@@ -62,7 +62,17 @@ _WORD_NUMBER_MAP = {
     "fifty": 50,
 }
 
-_GENERATION_WORDS = {"random", "synthetic", "fake", "sample", "demo", "generated", "generate"}
+_GENERATION_WORDS = {
+    "random",
+    "randomly",
+    "randomized",
+    "synthetic",
+    "fake",
+    "sample",
+    "demo",
+    "generated",
+    "generate",
+}
 _EMPLOYEE_WORDS = {"employee", "employees", "worker", "workers", "staff", "person", "persons", "people"}
 
 
@@ -104,7 +114,9 @@ def _normalize_optional_text(value: str | None, *, max_length: int = 120) -> str
 def _extract_count(question: str) -> int | None:
     """Extract one requested employee count from a short natural-language prompt."""
 
-    generation_qualifiers = r"(?:(?:random|synthetic|fake|sample|demo)\s+){0,3}"
+    generation_qualifiers = (
+    r"(?:(?:random|randomly|randomized|synthetic|fake|sample|demo)\s+){0,3}"
+)
     numeric_match = re.search(
         rf"\b([0-9]{{1,3}})\s+{generation_qualifiers}(?:employee|employees|worker|workers|staff|person|persons|people|records?)\b",
         question,

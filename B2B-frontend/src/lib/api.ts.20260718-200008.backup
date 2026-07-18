@@ -1,14 +1,8 @@
 import type { ApiEnvelope, UserRole } from './types';
 
-// In local Vite development, use same-origin URLs and let Vite proxy requests
-// to FastAPI. Production builds still use VITE_API_BASE_URL.
-const CONFIGURED_API_BASE = String(
-  import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000',
-).replace(/\/$/, '');
-const API_BASE = import.meta.env.DEV ? '' : CONFIGURED_API_BASE;
-const API_DESTINATION = import.meta.env.DEV
-  ? 'the local Vite proxy (FastAPI at http://127.0.0.1:8000)'
-  : CONFIGURED_API_BASE;
+// Prefer the Vite environment value, but keep local development usable when .env
+// has not been copied yet. Remove trailing slashes to avoid //api/... URLs.
+const API_BASE = String(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 
 
 export class ApiError extends Error {
@@ -44,7 +38,7 @@ export async function request<T = Record<string, unknown>>(
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'Network request failed.';
     throw new ApiError(
-      `Cannot reach ${API_DESTINATION}. Start FastAPI on port 8000 and restart Vite. (${detail})`,
+      `Cannot reach the backend at ${API_BASE}. Start FastAPI and verify VITE_API_BASE_URL/CORS. (${detail})`,
       0,
       'backend_unreachable',
     );
