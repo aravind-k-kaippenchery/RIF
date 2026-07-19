@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from starlette.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND, HTTP_503_SERVICE_UNAVAILABLE
 
 from app.agents.orchestrator import AgentOrchestrationError, agent_orchestrator
+from app.agents.router import classify_question
 from app.core.constants import ResponseStatus, UserRole
 from app.core.exceptions import AppError
 from app.core.request_context import get_request_id
@@ -25,6 +26,10 @@ from app.mcp.client import LocalMCPClient
 from app.schemas.phase13 import FrontendQueryRequest
 from app.models.operations import ActionLog, QueryLog
 from app.services.session_memory_service import build_memory_context, get_session_history, write_agent_memory_event
+from app.services.conversation_context_service import (
+    conversation_reference_from_result,
+    resolve_conversation_followup,
+)
 from app.services.session_service import create_session, get_active_session
 
 router = APIRouter(prefix="/api", tags=["Frontend-ready integration"])
@@ -82,6 +87,50 @@ def frontend_query(
     request.state.session_id = str(session.id)
     memory_context = build_memory_context(db, session_id=session.id)
     started = perf_counter()
+
+    # Resolve vague references deterministically before routing to Ollama/SQL.  This is
+    # the guard that makes "Can I see it?" refer to the exact persisted pending or
+    # confirmed action instead of allowing the model to reuse an unrelated old filter.
+    resolution = resolve_conversation_followup(db, session_id=session.id, question=payload.question)
+    if resolution.handled:
+        resolution_data = dict(resolution.data or {})
+        conversation_reference = conversation_reference_from_result(
+            pending_action_id=resolution.pending_action_id,
+            route=resolution.route.value,
+            status=resolution.status.value,
+            data=resolution_data,
+        )
+        memory_audit = write_agent_memory_event(
+            db,
+            request_id=get_request_id(request),
+            session_id=session.id,
+            question=payload.question,
+            route=resolution.route.value,
+            status=resolution.status.value,
+            answer=resolution.answer,
+            generated_sql=None,
+            sources=[],
+            latency_ms=round((perf_counter() - started) * 1000),
+            conversation_reference=conversation_reference,
+        )
+        resolution_data["session"] = {
+            "session_id": str(session.id),
+            "created_for_request": payload.session_id is None,
+            "memory_context_event_count": memory_context["event_count"],
+            "memory_policy": memory_context["policy"],
+            "memory_log": memory_audit,
+        }
+        return ResponseBuilder.success(
+            request,
+            route=resolution.route,
+            status=resolution.status,
+            answer=resolution.answer,
+            data=resolution_data,
+            sources=[],
+            generated_sql=None,
+            pending_action_id=resolution.pending_action_id,
+        )
+
     try:
         result = agent_orchestrator.run(
             question=payload.question,
@@ -93,8 +142,30 @@ def frontend_query(
             memory_context=memory_context,
         )
     except AgentOrchestrationError as exc:
+        # Failed requests are part of conversation state.  Without this event, a later
+        # "show it" could incorrectly fall back to an older successful action.
+        decision = classify_question(payload.question)
+        write_agent_memory_event(
+            db,
+            request_id=get_request_id(request),
+            session_id=session.id,
+            question=payload.question,
+            route=decision.route.value,
+            status=exc.status.value,
+            answer=exc.message,
+            generated_sql=None,
+            sources=[],
+            latency_ms=round((perf_counter() - started) * 1000),
+            error_code=exc.code,
+        )
         _raise_agent_error(exc)
 
+    conversation_reference = conversation_reference_from_result(
+        pending_action_id=result.pending_action_id,
+        route=result.route.value,
+        status=result.status.value,
+        data=result.data,
+    )
     memory_audit = write_agent_memory_event(
         db,
         request_id=get_request_id(request),
@@ -106,6 +177,7 @@ def frontend_query(
         generated_sql=result.generated_sql,
         sources=[item.model_dump() for item in result.sources],
         latency_ms=round((perf_counter() - started) * 1000),
+        conversation_reference=conversation_reference,
     )
     data = dict(result.data)
     data["session"] = {

@@ -123,6 +123,61 @@ class LLMService:
             return True
         return False
 
+    @classmethod
+    def _ollama_compatible_schema(cls, value: Any) -> Any:
+        """Remove annotation/validation keywords that some Ollama grammar builds reject.
+
+        The complete Pydantic schema is still included in the system prompt and the
+        returned JSON is always validated by Pydantic, so removing these format-only
+        constraints does not weaken backend validation.
+        """
+
+        unsupported = {
+            "title",
+            "description",
+            "examples",
+            "default",
+            "minLength",
+            "maxLength",
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "pattern",
+        }
+        if isinstance(value, dict):
+            return {
+                key: cls._ollama_compatible_schema(item)
+                for key, item in value.items()
+                if key not in unsupported
+            }
+        if isinstance(value, list):
+            return [cls._ollama_compatible_schema(item) for item in value]
+        return value
+
+    def _send_chat_with_format_fallback(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """Use JSON Schema first, then retry the same attempt in JSON mode on HTTP 400.
+
+        This handles Ollama builds that support structured JSON but reject one of the
+        Pydantic-schema keywords. Python/Pydantic validation remains mandatory.
+        """
+
+        try:
+            return self._send_chat_request(payload), "json_schema"
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400 or payload.get("format") == "json":
+                raise
+
+            fallback_payload = dict(payload)
+            fallback_payload["format"] = "json"
+            log_event(
+                level="WARNING",
+                event="ollama_schema_format_rejected_retrying_json_mode",
+                status_code=exc.response.status_code,
+            )
+            return self._send_chat_request(fallback_payload), "json"
+
     def _fetch_tags(self) -> dict[str, Any]:
         self._require_local_endpoint()
         settings = get_settings()
@@ -247,6 +302,7 @@ class LLMService:
         )
         resolved_seed = self.DEFAULT_OLLAMA_SEED if seed is None else seed
         json_schema = output_model.model_json_schema()
+        ollama_schema = self._ollama_compatible_schema(json_schema)
         full_system_prompt = prompts.with_output_schema(system_prompt, json_schema)
         correction_feedback: str | None = None
         last_error = "The model response did not match the required JSON contract."
@@ -279,7 +335,7 @@ class LLMService:
                     {"role": "user", "content": attempt_user_prompt},
                 ],
                 "stream": False,
-                "format": json_schema,
+                "format": ollama_schema,
                 "keep_alive": settings.ollama_keep_alive,
                 "options": {
                     "temperature": resolved_temperature,
@@ -287,7 +343,7 @@ class LLMService:
                 },
             }
             try:
-                body = self._send_chat_request(payload)
+                body, format_mode = self._send_chat_with_format_fallback(payload)
                 parsed = output_model.model_validate_json(self._response_content(body))
                 if semantic_validator is not None:
                     is_valid, semantic_error = semantic_validator(parsed)
@@ -305,13 +361,41 @@ class LLMService:
                     total_duration_ns=metadata.total_duration_ns,
                     temperature=resolved_temperature,
                     seed=attempt_seed,
+                    format_mode=format_mode,
                 )
                 return parsed, metadata
             except ValidationError as exc:
                 last_error = "The response was not valid JSON for the required output schema."
                 correction_feedback = last_error
-            except httpx.HTTPError as exc:
-                log_event(level="WARNING", event="ollama_http_error", error_type=type(exc).__name__)
+            except httpx.TimeoutException as exc:
+                log_event(
+                    level="WARNING",
+                    event="ollama_request_timeout",
+                    error_type=type(exc).__name__,
+                    timeout_seconds=settings.ollama_request_timeout_seconds,
+                )
+                raise OllamaUnavailableError(
+                    code="ollama_request_timed_out",
+                    message=(
+                        "Local Ollama timed out while generating the structured response. "
+                        f"The configured timeout is {settings.ollama_request_timeout_seconds} seconds."
+                    ),
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                response_text = (exc.response.text or "")[:500]
+                log_event(
+                    level="WARNING",
+                    event="ollama_http_status_error",
+                    error_type=type(exc).__name__,
+                    status_code=exc.response.status_code,
+                    response_preview=response_text,
+                )
+                raise OllamaUnavailableError(
+                    code="ollama_http_error",
+                    message=f"Local Ollama rejected the structured request with HTTP {exc.response.status_code}.",
+                ) from exc
+            except httpx.RequestError as exc:
+                log_event(level="WARNING", event="ollama_request_error", error_type=type(exc).__name__)
                 raise OllamaUnavailableError(
                     code="ollama_request_failed",
                     message="Local Ollama could not complete the generation request.",

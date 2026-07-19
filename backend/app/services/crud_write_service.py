@@ -9,7 +9,7 @@ request body.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -71,6 +71,10 @@ class WriteConfirmationResult:
     affected_row_count: int
     before_snapshot_count: int
     after_snapshot_count: int
+    affected_record_ids: list[dict[str, Any]] = field(default_factory=list)
+    affected_records: list[dict[str, Any]] = field(default_factory=list)
+    expected_row_count: int | None = None
+    count_verified: bool = False
     idempotent: bool = False
 
 
@@ -230,6 +234,60 @@ class CrudWriteService:
                 )
 
     @staticmethod
+    def _expected_bulk_count(
+        records: list[dict[str, Any]],
+        *,
+        generation_metadata: dict[str, Any] | None = None,
+        count_contract: dict[str, Any] | None = None,
+    ) -> int:
+        """Resolve and enforce one exact count across generation, preview, storage, and confirmation."""
+
+        candidates: list[tuple[str, Any]] = [("stored_records", len(records))]
+        metadata = generation_metadata if isinstance(generation_metadata, dict) else {}
+        contract = count_contract if isinstance(count_contract, dict) else {}
+        for name in ("requested_record_count", "generated_record_count"):
+            if name in metadata:
+                candidates.append((name, metadata.get(name)))
+        for name in ("requested_record_count", "generated_record_count", "preview_record_count", "stored_record_count"):
+            if name in contract:
+                candidates.append((name, contract.get(name)))
+
+        normalized: list[tuple[str, int]] = []
+        for name, raw in candidates:
+            if isinstance(raw, bool):
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            normalized.append((name, value))
+
+        if not normalized:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="bulk_count_contract_missing",
+                message="The bulk action does not contain a valid record count.",
+            )
+
+        expected = normalized[0][1]
+        if expected < 1:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="bulk_count_must_be_positive",
+                message="A bulk insert must contain at least one record.",
+            )
+
+        mismatches = [{"stage": name, "count": value} for name, value in normalized if value != expected]
+        if mismatches:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="bulk_count_contract_mismatch",
+                message="The requested, generated, previewed, and stored bulk counts do not match. No write was executed.",
+                details=[{"expected_count": expected, "observed_counts": dict(normalized), "mismatches": mismatches}],
+            )
+        return expected
+
+    @staticmethod
     def _where_sql(expression: exp.Expression) -> str | None:
         where = expression.args.get("where")
         if isinstance(where, exp.Where):
@@ -295,6 +353,36 @@ class CrudWriteService:
     def _summary(action_type: str, target_table: str, affected_count: int) -> str:
         noun = "record" if affected_count == 1 else "records"
         return f"Preview: {action_type.lower()} {affected_count} {noun} in {target_table}. Confirmation is required before execution."
+
+    @staticmethod
+    def _record_identities(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return stable business identifiers for action memory without storing full rows."""
+
+        identity_keys = (
+            "id",
+            "employee_code",
+            "vendor_code",
+            "customer_code",
+            "product_code",
+            "deal_code",
+            "permission_code",
+            "vendor_sku",
+            "email",
+            "contact_email",
+        )
+        identities: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            identity: dict[str, Any] = {}
+            for key in identity_keys:
+                value = record.get(key)
+                if value not in (None, ""):
+                    identity[key] = json_safe(value)
+                    if key == "id" or key.endswith("_code"):
+                        break
+            if not identity:
+                identity = {"record_index": index}
+            identities.append(identity)
+        return identities
 
     def propose_sql_write(
         self,
@@ -429,6 +517,24 @@ class CrudWriteService:
         target_table = target_table.strip().lower()
         self._business_table(target_table)
         self._validate_records(target_table, records)
+        metadata = dict(generation_metadata or {})
+        requested_count = self._expected_bulk_count(records, generation_metadata=metadata)
+        generated_count = len(records)
+        count_contract = {
+            "requested_record_count": requested_count,
+            "generated_record_count": generated_count,
+            "preview_record_count": generated_count,
+            "stored_record_count": generated_count,
+            "confirmed_record_count": None,
+            "count_verified": True,
+        }
+        metadata.update(
+            {
+                "requested_record_count": requested_count,
+                "generated_record_count": generated_count,
+                "count_verified": True,
+            }
+        )
         inside_batch = find_batch_duplicates(target_table, records)
         if inside_batch:
             raise CrudWriteError(
@@ -449,12 +555,17 @@ class CrudWriteService:
                 details=duplicates,
             )
         preview = {
-            "summary": self._summary("BULK_INSERT", target_table, len(records)),
+            "summary": self._summary("BULK_INSERT", target_table, generated_count),
             "requires_confirmation": True,
-            "record_count": len(records),
+            "target_table": target_table,
+            "record_count": generated_count,
+            "requested_record_count": requested_count,
+            "generated_record_count": generated_count,
+            "preview_record_count": generated_count,
             "records": records,
-            "duplicate_check": {"status": "clear", "checked_record_count": len(records)},
-            "generation_metadata": generation_metadata,
+            "duplicate_check": {"status": "clear", "checked_record_count": generated_count},
+            "generation_metadata": metadata,
+            "count_contract": count_contract,
         }
         action = create_pending_action(
             db,
@@ -467,7 +578,8 @@ class CrudWriteService:
                 "target_table": target_table,
                 "records": records,
                 "user_prompt": user_prompt,
-                "generation_metadata": generation_metadata,
+                "generation_metadata": metadata,
+                "count_contract": count_contract,
             },
             preview_data=preview,
             generated_sql=None,
@@ -568,12 +680,30 @@ class CrudWriteService:
         self._require_session(db, session_id, actor_role)
         action = self._load_pending_for_mutation(db, session_id=session_id, action_id=pending_action_id)
         if action.status == "confirmed":
+            payload = action.validated_payload if isinstance(action.validated_payload, dict) else {}
+            records = payload.get("records") if isinstance(payload.get("records"), list) else []
+            records = [dict(item) for item in records if isinstance(item, dict)]
+            existing_log = db.scalar(
+                select(ActionLog)
+                .where(ActionLog.pending_action_id == action.id, ActionLog.status == "success")
+                .order_by(ActionLog.created_at.desc())
+            )
+            affected = existing_log.affected_record_ids if existing_log and isinstance(existing_log.affected_record_ids, dict) else {}
+            identities = affected.get("record_ids") if isinstance(affected.get("record_ids"), list) else self._record_identities(records)
+            generation_metadata = payload.get("generation_metadata") if isinstance(payload.get("generation_metadata"), dict) else {}
+            count_contract = payload.get("count_contract") if isinstance(payload.get("count_contract"), dict) else {}
+            expected_count = self._expected_bulk_count(records, generation_metadata=generation_metadata, count_contract=count_contract) if records else None
+            affected_count = int(affected.get("affected_row_count") or len(records))
             return WriteConfirmationResult(
                 pending_action=pending_action_to_dict(action),
-                action_log_id=None,
-                affected_row_count=0,
-                before_snapshot_count=0,
-                after_snapshot_count=0,
+                action_log_id=existing_log.id if existing_log else None,
+                affected_row_count=affected_count,
+                before_snapshot_count=int(affected.get("before_snapshot_count") or 0),
+                after_snapshot_count=int(affected.get("after_snapshot_count") or len(records)),
+                affected_record_ids=identities,
+                affected_records=[{str(key): json_safe(value) for key, value in item.items()} for item in records],
+                expected_row_count=expected_count,
+                count_verified=expected_count is None or affected_count == expected_count,
                 idempotent=True,
             )
 
@@ -585,6 +715,8 @@ class CrudWriteService:
         before_rows: list[dict[str, Any]] = []
         after_rows: list[dict[str, Any]] = []
         affected_count = 0
+        expected_row_count: int | None = None
+        count_verified = False
         try:
             if mode == "sql":
                 sql = payload.get("sql")
@@ -626,6 +758,11 @@ class CrudWriteService:
                     self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=row, snapshot_type="before")
                 result = db.execute(text(validation.normalized_sql or sql))
                 affected_count = max(0, int(result.rowcount or 0))
+                if statement_type == "INSERT":
+                    stored_records = payload.get("records") if isinstance(payload.get("records"), list) else []
+                    after_rows = [dict(item) for item in stored_records if isinstance(item, dict)]
+                    for row in after_rows:
+                        self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=row, snapshot_type="after")
                 if statement_type == "UPDATE":
                     after_rows = self._rows_by_primary_ids(db, target_table=target_table, before_rows=before_rows)
                     for row in after_rows:
@@ -634,6 +771,14 @@ class CrudWriteService:
                 records = payload.get("records")
                 if not isinstance(records, list) or not records or not all(isinstance(record, dict) for record in records):
                     raise CrudWriteError(status=ResponseStatus.VALIDATION_FAILED, code="stored_bulk_records_missing", message="The stored bulk record payload is invalid.")
+                records = [dict(record) for record in records]
+                generation_metadata = payload.get("generation_metadata") if isinstance(payload.get("generation_metadata"), dict) else {}
+                count_contract = payload.get("count_contract") if isinstance(payload.get("count_contract"), dict) else {}
+                expected_row_count = self._expected_bulk_count(
+                    records,
+                    generation_metadata=generation_metadata,
+                    count_contract=count_contract,
+                )
                 self._validate_records(target_table, records)
                 for record in records:
                     matches = detect_record_duplicates(db, table_name=target_table, values=record)
@@ -656,22 +801,49 @@ class CrudWriteService:
                     status="executing",
                     confirmation_status="confirmed",
                 )
-                result = db.execute(table.insert(), records)
-                affected_count = max(0, int(result.rowcount or len(records)))
-                for index, record in enumerate(records):
+                insert_statement = table.insert().returning(*table.columns)
+                result = db.execute(insert_statement, records)
+                after_rows = [row_to_dict(row) for row in result.mappings().all()]
+                affected_count = len(after_rows)
+                if affected_count != expected_row_count:
+                    raise CrudWriteError(
+                        status=ResponseStatus.TOOL_FAILED,
+                        code="confirmed_bulk_count_mismatch",
+                        message=(
+                            f"PostgreSQL returned {affected_count} inserted records, but {expected_row_count} were stored in the confirmed preview. "
+                            "The transaction was rolled back."
+                        ),
+                        details=[
+                            {
+                                "requested_record_count": expected_row_count,
+                                "confirmed_record_count": affected_count,
+                                "pending_action_id": str(action.id),
+                                "target_table": target_table,
+                            }
+                        ],
+                    )
+                count_verified = True
+                for index, record in enumerate(after_rows):
                     snapshot_record = {**record, "record_index": index}
                     self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=snapshot_record, snapshot_type="after")
-                after_rows = records
             else:
                 raise CrudWriteError(status=ResponseStatus.VALIDATION_FAILED, code="unsupported_pending_action_mode", message="The pending action does not contain an executable Phase 7 payload.")
 
             action.status = "confirmed"
             action.confirmed_at = _utc_now()
             action_log.status = "success"
+            affected_records = after_rows if after_rows else before_rows
+            affected_record_ids = self._record_identities(affected_records)
             action_log.affected_record_ids = {
                 "affected_row_count": affected_count,
                 "before_snapshot_count": len(before_rows),
                 "after_snapshot_count": len(after_rows),
+                "record_ids": affected_record_ids,
+                "pending_action_id": str(action.id),
+                "target_table": target_table,
+                "action_type": action.action_type,
+                "expected_row_count": expected_row_count,
+                "count_verified": count_verified if expected_row_count is not None else True,
             }
             db.commit()
             db.refresh(action)
@@ -681,6 +853,10 @@ class CrudWriteService:
                 affected_row_count=affected_count,
                 before_snapshot_count=len(before_rows),
                 after_snapshot_count=len(after_rows),
+                affected_record_ids=affected_record_ids,
+                affected_records=[{str(key): json_safe(value) for key, value in item.items()} for item in affected_records],
+                expected_row_count=expected_row_count,
+                count_verified=count_verified if expected_row_count is not None else True,
                 idempotent=False,
             )
         except CrudWriteError:

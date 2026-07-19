@@ -24,6 +24,7 @@ from app.services.session_service import (
     session_to_dict,
 )
 from app.services.session_memory_service import SessionMemoryError, close_session, get_session_history
+from app.services.conversation_context_service import build_conversation_state
 
 router = APIRouter(prefix="/api/sessions", tags=["Session service"])
 
@@ -184,6 +185,28 @@ def get_session_history_endpoint(
         request,
         answer="Short-term session history retrieved.",
         data=history,
+    )
+
+
+@router.get("/{session_id}/context", summary="Inspect deterministic action-aware conversation state")
+def get_session_context_endpoint(
+    session_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db_session),
+):
+    try:
+        session = get_session(db, session_id)
+        if session is None:
+            raise _session_not_found(session_id)
+        state = build_conversation_state(db, session_id=session_id)
+    except AppError:
+        raise
+    except SQLAlchemyError as exc:
+        raise _database_unavailable_error() from exc
+    return ResponseBuilder.success(
+        request,
+        answer="Deterministic conversation context retrieved. This state is used to resolve references without model guessing.",
+        data=state,
     )
 
 

@@ -155,16 +155,35 @@ def confirm_write(
         raise AppError(status=ResponseStatus.VALIDATION_FAILED, code="invalid_pending_action_id", message="pending_action_id must be a UUID.", http_status_code=HTTP_400_BAD_REQUEST) from exc
     except CrudWriteError as exc:
         _raise_crud_error(exc)
+    if result.idempotent:
+        answer = "Confirmation was already processed earlier; no duplicate write was executed."
+    elif result.expected_row_count is not None:
+        answer = f"Confirmed write inserted exactly {result.affected_row_count} record{'s' if result.affected_row_count != 1 else ''}. The requested count was verified."
+    else:
+        answer = "Confirmed write executed successfully with audit logging and snapshots."
+
     return ResponseBuilder.success(
         request,
         route=AgentRoute.CRUD_WRITE,
-        answer=("Confirmation was already processed earlier; no duplicate write was executed." if result.idempotent else "Confirmed write executed successfully with audit logging and snapshots."),
+        answer=answer,
         data={
             "pending_action": result.pending_action,
             "action_log_id": result.action_log_id,
             "affected_row_count": result.affected_row_count,
             "before_snapshot_count": result.before_snapshot_count,
             "after_snapshot_count": result.after_snapshot_count,
+            "affected_record_ids": result.affected_record_ids,
+            "affected_records": result.affected_records,
+            "rows": result.affected_records,
+            "requested_record_count": result.expected_row_count,
+            "confirmed_record_count": result.affected_row_count if result.expected_row_count is not None else None,
+            "count_verified": result.count_verified,
+            "count_contract": {
+                "requested_record_count": result.expected_row_count,
+                "confirmed_record_count": result.affected_row_count if result.expected_row_count is not None else None,
+                "returned_record_count": len(result.affected_records),
+                "count_verified": result.count_verified,
+            } if result.expected_row_count is not None else None,
             "idempotent": result.idempotent,
             "write_execution_allowed": True,
             "write_execution_mode": "confirmed_pending_action_only",

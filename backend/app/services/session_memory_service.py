@@ -71,6 +71,7 @@ def _action_event(action: ActionLog) -> dict[str, Any]:
         "target_table": action.target_table,
         "status": action.status,
         "confirmation_status": action.confirmation_status,
+        "pending_action_id": str(action.pending_action_id) if action.pending_action_id else None,
         "affected_record_ids": _serialize_value(action.affected_record_ids or {}),
         "generated_sql": action.generated_sql,
         "error_message": action.error_message,
@@ -123,16 +124,18 @@ def get_session_history(db: DbSession, *, session_id: UUID, limit: int = 20) -> 
 
 
 def build_memory_context(db: DbSession, *, session_id: UUID, limit: int = MAX_MEMORY_EVENTS) -> dict[str, Any]:
-    """Build compact, persisted prior-context suitable for a local model prompt.
+    """Build a compact prior-query context for the local SQL model.
 
-    It intentionally includes prior prompts, routes, validated SQL, and source references,
-    but excludes database credentials, full rows, raw OCR text, and hidden reasoning.
+    Action/batch references are resolved by ``conversation_context_service`` before the
+    model is called. They are intentionally not copied into the Ollama prompt. Keeping
+    this prompt query-only prevents a growing session from causing oversized/slow local
+    generation requests while preserving deterministic conversation memory.
     """
 
     history = get_session_history(db, session_id=session_id, limit=limit)
     events: list[dict[str, Any]] = []
     for event in history["events"]:
-        if event["event_type"] != "query":
+        if event.get("event_type") != "query":
             continue
         events.append(
             {
@@ -140,14 +143,16 @@ def build_memory_context(db: DbSession, *, session_id: UUID, limit: int = MAX_ME
                 "route": event.get("route"),
                 "status": event.get("status"),
                 "generated_sql": event.get("generated_sql"),
-                "source_references": event.get("source_references"),
             }
         )
     return {
         "available": bool(events),
         "event_count": len(events),
         "events": events,
-        "policy": "bounded persisted session context; no credentials, hidden reasoning, or unrestricted records",
+        "policy": (
+            "compact query-only session context for Ollama; action references are "
+            "resolved deterministically outside the model"
+        ),
     }
 
 
@@ -164,6 +169,7 @@ def write_agent_memory_event(
     sources: list[dict[str, Any]],
     latency_ms: int | None = None,
     error_code: str | None = None,
+    conversation_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist one completed agent result in query_logs without duplicating request IDs.
 
@@ -178,6 +184,7 @@ def write_agent_memory_event(
         "source_type": "agent_memory",
         "assistant_answer": answer,
         "sources": sources[:10],
+        "conversation_reference": _serialize_value(conversation_reference) if conversation_reference else None,
     }
     try:
         existing = db.scalar(select(QueryLog).where(QueryLog.request_id == request_id))

@@ -214,7 +214,7 @@ class AgentOrchestrator:
             return {
                 "session_id": session_id,
                 "status": ResponseStatus.PENDING_CONFIRMATION.value,
-                "answer": "Faker generated a synthetic employee batch and the backend completed duplicate checks. No database row was changed; explicit confirmation is required.",
+                "answer": f"Faker generated exactly {len(batch.records)} synthetic employee record{'s' if len(batch.records) != 1 else ''}. The backend verified the count and completed duplicate checks. No database row was changed; explicit confirmation is required.",
                 "generated_sql": None,
                 "pending_action_id": result.pending_action["pending_action_id"],
                 "sources": [],
@@ -226,7 +226,16 @@ class AgentOrchestrator:
                     "preview": result.preview,
                     "validation": None,
                     "duplicate_matches": result.duplicate_matches,
+                    "requested_record_count": synthetic_request.count,
                     "generated_record_count": len(batch.records),
+                    "preview_record_count": result.preview.get("record_count"),
+                    "count_verified": (
+                        synthetic_request.count
+                        == len(batch.records)
+                        == int(result.preview.get("record_count") or 0)
+                    ),
+                    "count_contract": result.preview.get("count_contract"),
+                    "rows": result.preview.get("records", []),
                     "generator": "faker",
                     "synthetic_generation": batch.metadata,
                     "write_execution_allowed": False,

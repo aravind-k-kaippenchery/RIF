@@ -46,3 +46,21 @@ def test_parse_add_ten_workers_randomly():
 
     assert request is not None
     assert request.count == 10
+import pytest
+
+
+@pytest.mark.parametrize("count", [1, 5, 10, 20, 50])
+def test_synthetic_employee_counts_are_exact_for_supported_demo_sizes(count):
+    request = parse_synthetic_employee_prompt(f"Create {count} random employees")
+
+    assert request is not None
+    assert request.count == count
+
+    batch = generate_synthetic_employees(request)
+
+    assert len(batch.records) == count
+    assert batch.metadata["requested_record_count"] == count
+    assert batch.metadata["generated_record_count"] == count
+    assert batch.metadata["count_verified"] is True
+    assert len({record["employee_code"] for record in batch.records}) == count
+    assert len({record["email"] for record in batch.records}) == count

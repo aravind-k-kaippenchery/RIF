@@ -836,3 +836,7 @@ button:focus-visible,
 .dashboard-benchmarks{display:grid;gap:16px;padding:21px}
 .embedded-workspace .workflow-page,.embedded-workspace .knowledge-page{animation:none}
 @media (max-width:620px){.workspace-tabs{display:grid;grid-template-columns:1fr 1fr}.workspace-tabs button{justify-content:center}.sub-tabs{display:grid;grid-template-columns:1fr}.dashboard-benchmarks{padding:16px}}
+
+/* Action-aware conversation memory: show the exact referenced batch inline. */
+.resolved-records{display:grid;gap:7px;margin-top:12px;padding-top:11px;border-top:1px solid rgba(148,163,184,.1)}
+.resolved-records>small{color:#8fb5d6;font:600 9px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em}

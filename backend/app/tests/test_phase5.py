@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -62,8 +63,36 @@ def test_generate_json_sends_pydantic_schema_and_validates_response():
     assert result.route == "structured_read"
     assert metadata.attempts == 1
     assert captured[0]["stream"] is False
-    assert captured[0]["format"] == IntentClassificationResult.model_json_schema()
+    assert captured[0]["format"]["type"] == "object"
+    assert "title" not in captured[0]["format"]
+    assert "properties" in captured[0]["format"]
     assert captured[0]["options"]["temperature"] == 0.0
+
+
+def test_generate_json_falls_back_to_plain_json_when_schema_format_gets_http_400():
+    service = LLMService()
+    request = httpx.Request("POST", "http://127.0.0.1:11434/api/chat")
+    rejected = httpx.Response(400, request=request, text="unsupported schema keyword")
+    calls: list[dict] = []
+
+    def fake_send(payload: dict) -> dict:
+        calls.append(payload)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError("bad request", request=request, response=rejected)
+        return _chat_body('{"route":"structured_read","requires_clarification":false,"clarification_question":null}')
+
+    with patch.object(service, "check_llm_health", return_value=READY), patch.object(service, "_send_chat_request", side_effect=fake_send):
+        result, metadata = service.generate_json(
+            output_model=IntentClassificationResult,
+            system_prompt="Classify safely.",
+            user_prompt="Show employees from Chennai",
+        )
+
+    assert result.route == "structured_read"
+    assert metadata.attempts == 1
+    assert len(calls) == 2
+    assert isinstance(calls[0]["format"], dict)
+    assert calls[1]["format"] == "json"
 
 
 def test_generate_json_retries_once_when_first_output_breaks_schema():

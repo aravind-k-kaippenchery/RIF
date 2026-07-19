@@ -266,6 +266,13 @@ def generate_synthetic_employees(request: SyntheticEmployeeRequest) -> Synthetic
             }
         )
 
+    generated_count = len(records)
+    if generated_count != request.count:
+        raise SyntheticEmployeeGenerationError(
+            "synthetic_employee_count_mismatch",
+            f"Faker generated {generated_count} records, but {request.count} were requested. No preview was created.",
+        )
+
     return SyntheticEmployeeBatch(
         records=records,
         metadata={
@@ -273,7 +280,9 @@ def generate_synthetic_employees(request: SyntheticEmployeeRequest) -> Synthetic
             "synthetic_data_only": True,
             "faker_locale": DEFAULT_FAKER_LOCALE,
             "batch_id": batch_id,
-            "generated_record_count": len(records),
+            "requested_record_count": request.count,
+            "generated_record_count": generated_count,
+            "count_verified": True,
             "target_table": "employees",
             "email_domain": "example.test",
             "department_constraint": request.department,

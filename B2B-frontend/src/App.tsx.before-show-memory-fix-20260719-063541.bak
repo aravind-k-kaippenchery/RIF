@@ -56,77 +56,6 @@ export function prettyKey(key: string) {
   return key.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export function normalizeEvidenceRows(value: unknown): Record<string, any>[] {
-  if (!Array.isArray(value)) return [];
-
-  return value.map((item, index) => {
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      return item as Record<string, any>;
-    }
-
-    if (typeof item === 'string') {
-      const raw = item.trim();
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            return parsed as Record<string, any>;
-          }
-        } catch {
-          // Older backend previews may contain Python-style stringified dictionaries.
-          const jsonLike = raw
-            .replace(/\bNone\b/g, 'null')
-            .replace(/\bTrue\b/g, 'true')
-            .replace(/\bFalse\b/g, 'false')
-            .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, key: string) => `${JSON.stringify(key)}:`)
-            .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, field: string) => `:${JSON.stringify(field)}`);
-          try {
-            const parsed = JSON.parse(jsonLike);
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              return parsed as Record<string, any>;
-            }
-          } catch {
-            // Fall through to a one-column safe display instead of rendering string characters.
-          }
-        }
-      }
-      return { record: item };
-    }
-
-    return { record_index: index + 1, value: item };
-  });
-}
-
-export function countContractFromData(data: Record<string, any>): Record<string, any> | null {
-  const raw = asRecord(data.count_contract || data.preview?.count_contract || data.pending_action?.preview_data?.count_contract);
-  const requested = data.requested_record_count ?? raw.requested_record_count ?? data.synthetic_generation?.requested_record_count;
-  const generated = data.generated_record_count ?? raw.generated_record_count ?? data.synthetic_generation?.generated_record_count;
-  const previewed = data.preview_record_count ?? raw.preview_record_count ?? data.preview?.record_count;
-  const stored = raw.stored_record_count;
-  const confirmed = data.confirmed_record_count ?? raw.confirmed_record_count ?? data.affected_row_count;
-  const returned = raw.returned_record_count ?? (Array.isArray(data.affected_records) ? data.affected_records.length : undefined);
-  const values = { requested_record_count: requested, generated_record_count: generated, preview_record_count: previewed, stored_record_count: stored, confirmed_record_count: confirmed, returned_record_count: returned };
-  const visible = Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== null));
-  if (!Object.keys(visible).length) return null;
-  return { ...visible, count_verified: data.count_verified ?? raw.count_verified ?? false };
-}
-
-export function evidenceRowsFromData(data: Record<string, any>): Record<string, any>[] {
-  const candidates = [
-    data.rows,
-    data.records,
-    data.results,
-    data.preview?.records,
-    data.pending_action?.preview_data?.records,
-    data.pending_action?.validated_payload?.records,
-  ];
-  for (const candidate of candidates) {
-    const rows = normalizeEvidenceRows(candidate);
-    if (rows.length) return rows;
-  }
-  return [];
-}
-
 export function formatTime(value: unknown) {
   if (!value) return 'Just now';
   const date = new Date(String(value));
@@ -613,25 +542,23 @@ function ChatMessage({ message, onInspect, onConfirm, onCancel }: { message: { i
   const data = asRecord(response?.data);
   const status = response?.status;
   const route = response?.route;
-  const contextualRows = normalizeEvidenceRows(data.rows);
+  const contextualRows = Array.isArray(data.rows) ? data.rows : [];
   const isResolvedReference = Boolean(data.conversation_resolution);
-  const countContract = countContractFromData(data);
-  const pendingCount = data.requested_record_count ?? data.generated_record_count ?? data.preview?.record_count ?? data.pending_action?.preview_data?.record_count;
-  return <div className="message-row assistant-row"><span className="assistant-avatar"><Sparkles size={16} /></span><div className="assistant-message"><div className="message-meta"><RouteBadge route={route} /><StatusBadge status={status || 'Response'} /></div><p>{message.text}</p>{isResolvedReference && contextualRows.length > 0 && <div className="resolved-records"><small>{contextualRows.length} referenced record{contextualRows.length === 1 ? '' : 's'}</small><DataPreview rows={contextualRows.slice(0, 50)} /></div>}{response?.sources?.length ? <div className="source-chip-row">{response.sources.slice(0, 4).map((source, index) => <button key={`${source.reference}-${index}`} className="source-chip" onClick={onInspect}><FileSearch size={12} /> {source.reference || source.source_type || 'Source'}</button>)}</div> : null}{response?.generated_sql && <button className="query-drawer" onClick={onInspect}><Code2 size={14} /> View validated query <ChevronRight size={14} /></button>}{status === 'pending_confirmation' && <div className="pending-card"><div><span className="pending-icon"><AlertTriangle size={18} /></span><div><b>Action requires confirmation</b><small>This action will change stored business data after confirmation.</small></div></div><div className="pending-details"><span>Target: <strong>{data.pending_action?.target_table || data.preview?.target_table || 'controlled record'}</strong></span><span>Action: <strong>{data.pending_action?.action_type || 'write'}</strong></span>{pendingCount ? <span>Records: <strong>{String(pendingCount)}</strong></span> : null}{countContract?.count_verified ? <span>Count: <strong>verified</strong></span> : null}</div><div className="pending-actions"><button className="button secondary" onClick={onCancel}>Cancel preview</button><button className="button warning" onClick={onConfirm}>Confirm action <ArrowRight size={15} /></button></div></div>}</div></div>;
+  const pendingCount = data.generated_record_count || data.preview?.record_count || data.pending_action?.preview_data?.record_count;
+  return <div className="message-row assistant-row"><span className="assistant-avatar"><Sparkles size={16} /></span><div className="assistant-message"><div className="message-meta"><RouteBadge route={route} /><StatusBadge status={status || 'Response'} /></div><p>{message.text}</p>{isResolvedReference && contextualRows.length > 0 && <div className="resolved-records"><small>{contextualRows.length} referenced record{contextualRows.length === 1 ? '' : 's'}</small><DataPreview rows={contextualRows.slice(0, 50)} /></div>}{response?.sources?.length ? <div className="source-chip-row">{response.sources.slice(0, 4).map((source, index) => <button key={`${source.reference}-${index}`} className="source-chip" onClick={onInspect}><FileSearch size={12} /> {source.reference || source.source_type || 'Source'}</button>)}</div> : null}{response?.generated_sql && <button className="query-drawer" onClick={onInspect}><Code2 size={14} /> View validated query <ChevronRight size={14} /></button>}{status === 'pending_confirmation' && <div className="pending-card"><div><span className="pending-icon"><AlertTriangle size={18} /></span><div><b>Action requires confirmation</b><small>This action will change stored business data after confirmation.</small></div></div><div className="pending-details"><span>Target: <strong>{data.pending_action?.target_table || data.preview?.target_table || 'controlled record'}</strong></span><span>Action: <strong>{data.pending_action?.action_type || 'write'}</strong></span>{pendingCount ? <span>Records: <strong>{String(pendingCount)}</strong></span> : null}</div><div className="pending-actions"><button className="button secondary" onClick={onCancel}>Cancel preview</button><button className="button warning" onClick={onConfirm}>Confirm action <ArrowRight size={15} /></button></div></div>}</div></div>;
 }
 
 function EvidencePanel({ response }: { response: ApiEnvelope<any> | null }) {
   if (!response) return <aside className="evidence-panel surface-card empty-evidence"><PanelRight size={24} /><h3>Evidence & traceability</h3><p>Ask a question to inspect source references, database evidence, retrieved chunks, and safe generated SQL.</p></aside>;
   const data = asRecord(response.data);
-  const rows = evidenceRowsFromData(data);
-  const countContract = countContractFromData(data);
+  const rows = Array.isArray(data.rows) ? data.rows : Array.isArray(data.records) ? data.records : Array.isArray(data.results) ? data.results : Array.isArray(data.preview?.records) ? data.preview.records : Array.isArray(data.pending_action?.preview_data?.records) ? data.pending_action.preview_data.records : Array.isArray(data.pending_action?.validated_payload?.records) ? data.pending_action.validated_payload.records : [];
   const chunks = Array.isArray(data.retrieved_chunks) ? data.retrieved_chunks : Array.isArray(data.matches) ? data.matches : [];
-  return <aside className="evidence-panel surface-card"><SectionHeading title="Evidence & traceability" eyebrow="READ-ONLY DETAIL" /><div className="evidence-section"><span>Route</span><RouteBadge route={response.route} /></div><div className="evidence-section"><span>Status</span><StatusBadge status={response.status} /></div>{response.sources?.length ? <div className="evidence-block"><h4>Answer sources</h4>{response.sources.map((source, index) => <div className="evidence-source" key={`${source.reference}-${index}`}><FileText size={15} /><div><b>{source.reference || source.source_type || 'Source'}</b><small>{source.detail || source.source_type || 'Grounded source'}</small></div></div>)}</div> : null}{response.generated_sql && <div className="evidence-block"><h4>Validated query</h4><pre>{response.generated_sql}</pre></div>}{countContract ? <div className="evidence-block"><h4>Bulk count verification</h4><div className="count-stack">{Object.entries(countContract).filter(([key]) => key !== 'count_verified').map(([key, value]) => <div className="count-row" key={key}><span>{prettyKey(key)}</span><b>{stringValue(value)}</b></div>)}<div className="count-row"><span>Count verified</span><b>{countContract.count_verified ? 'Yes' : 'Pending'}</b></div></div></div> : null}{rows.length ? <div className="evidence-block"><h4>Database evidence · {rows.length} record{rows.length === 1 ? '' : 's'}</h4><DataPreview rows={rows.slice(0, 50)} /></div> : null}{chunks.length ? <div className="evidence-block"><h4>Retrieved chunks</h4>{chunks.slice(0, 3).map((chunk: any, index: number) => <div className="chunk" key={chunk.reference || index}><b>{chunk.reference || chunk.filename || `Chunk ${index + 1}`}</b><p>{chunk.text_preview || chunk.text || chunk.content || 'Document evidence retrieved.'}</p></div>)}</div> : null}</aside>;
+  return <aside className="evidence-panel surface-card"><SectionHeading title="Evidence & traceability" eyebrow="READ-ONLY DETAIL" /><div className="evidence-section"><span>Route</span><RouteBadge route={response.route} /></div><div className="evidence-section"><span>Status</span><StatusBadge status={response.status} /></div>{response.sources?.length ? <div className="evidence-block"><h4>Answer sources</h4>{response.sources.map((source, index) => <div className="evidence-source" key={`${source.reference}-${index}`}><FileText size={15} /><div><b>{source.reference || source.source_type || 'Source'}</b><small>{source.detail || source.source_type || 'Grounded source'}</small></div></div>)}</div> : null}{response.generated_sql && <div className="evidence-block"><h4>Validated query</h4><pre>{response.generated_sql}</pre></div>}{rows.length ? <div className="evidence-block"><h4>Database evidence · {rows.length} record{rows.length === 1 ? '' : 's'}</h4><DataPreview rows={rows.slice(0, 50)} /></div> : null}{chunks.length ? <div className="evidence-block"><h4>Retrieved chunks</h4>{chunks.slice(0, 3).map((chunk: any, index: number) => <div className="chunk" key={chunk.reference || index}><b>{chunk.reference || chunk.filename || `Chunk ${index + 1}`}</b><p>{chunk.text_preview || chunk.text || chunk.content || 'Document evidence retrieved.'}</p></div>)}</div> : null}</aside>;
 }
 
 function ConfirmModal({ response, onClose, onConfirm }: { response: ApiEnvelope<any>; onClose: () => void; onConfirm: () => void }) {
   const data = asRecord(response.data); const action = data.pending_action || data.preview || {};
-  return <div className="modal-backdrop"><div className="confirm-modal"><span className="confirm-icon"><AlertTriangle size={24} /></span><div className="eyebrow compact"><i /> EXPLICIT CONFIRMATION REQUIRED</div><h3>Confirm database change?</h3><p>You are about to execute one stored, validator-approved action. The action and its outcome will be recorded in audit history.</p><div className="confirm-summary"><span>Action <b>{action.action_type || 'write'}</b></span><span>Target <b>{action.target_table || data.preview?.target_table || 'business data'}</b></span>{(data.requested_record_count ?? data.preview?.record_count) ? <span>Records <b>{String(data.requested_record_count ?? data.preview?.record_count)}</b></span> : null}<span>Pending ID <b>{response.pending_action_id || '—'}</b></span></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Go back</button><button className="button warning" onClick={onConfirm}>Confirm and execute <ShieldCheck size={16} /></button></div></div></div>;
+  return <div className="modal-backdrop"><div className="confirm-modal"><span className="confirm-icon"><AlertTriangle size={24} /></span><div className="eyebrow compact"><i /> EXPLICIT CONFIRMATION REQUIRED</div><h3>Confirm database change?</h3><p>You are about to execute one stored, validator-approved action. The action and its outcome will be recorded in audit history.</p><div className="confirm-summary"><span>Action <b>{action.action_type || 'write'}</b></span><span>Target <b>{action.target_table || 'business data'}</b></span><span>Pending ID <b>{response.pending_action_id || '—'}</b></span></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Go back</button><button className="button warning" onClick={onConfirm}>Confirm and execute <ShieldCheck size={16} /></button></div></div></div>;
 }
 
 function Explorer({ user, toast }: { user: LocalUser; toast: (message: string, type?: Toast['type']) => void }) {
@@ -720,7 +647,7 @@ export function SkeletonLines() { return <div className="skeleton-lines"><i/><i/
 export function TableSkeleton() { return <div className="table-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><i/><i/><i/><i/><i/></div>)}</div>; }
 function LogoMark() { return <span className="logo-mark"><Sparkles size={18} /><i /><b /></span>; }
 function FileTypeIcon({ type }: { type?: string }) { const lower = (type || '').toLowerCase(); return <span className="file-icon">{lower.includes('pdf') ? <FileText size={21} /> : lower.includes('image') || lower.includes('png') || lower.includes('jpg') ? <FileSearch size={21} /> : lower.includes('doc') ? <FileCode2 size={21} /> : <FileText size={21} />}</span>; }
-export function DataPreview({ rows }: { rows: any[] }) { const normalizedRows = normalizeEvidenceRows(rows); if (!normalizedRows.length) return null; const columns = Array.from(new Set(normalizedRows.flatMap((row) => Object.keys(row)))).slice(0, 6); return <div className="data-preview"><div className="preview-head">{columns.map((column) => <span key={column}>{prettyKey(column)}</span>)}</div>{normalizedRows.map((row, index) => <div className="preview-row" key={row.id || row.employee_code || index}>{columns.map((column) => <span key={column}>{stringValue(row[column])}</span>)}</div>)}</div>; }
+export function DataPreview({ rows }: { rows: any[] }) { if (!rows.length) return null; const columns = Object.keys(rows[0]).slice(0, 4); return <div className="data-preview"><div className="preview-head">{columns.map((column) => <span key={column}>{prettyKey(column)}</span>)}</div>{rows.map((row, index) => <div className="preview-row" key={index}>{columns.map((column) => <span key={column}>{stringValue(row[column])}</span>)}</div>)}</div>; }
 export function RecordTable({ rows, onRow }: { rows: any[]; onRow: (row: any) => void }) { if (!rows.length) return <Empty icon={<Table2 size={24} />} title="No visible records" text="The controlled backend returned no matching records for this view." />; const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 8); return <div className="record-table-wrap"><table className="record-table"><thead><tr>{columns.map((column) => <th key={column}>{prettyKey(column)}</th>)}<th /></tr></thead><tbody>{rows.map((row, index) => <tr key={row.id || row.employee_code || index} onClick={() => onRow(row)}>{columns.map((column) => <td key={column} className={column.includes('id') || column.includes('code') || column.includes('date') || column.includes('at') ? 'mono' : ''}>{stringValue(row[column])}</td>)}<td><ChevronRight size={16} /></td></tr>)}</tbody></table></div>; }
 function RecordDrawer({ row, onClose }: { row: Record<string, any>; onClose: () => void }) { return <div className="drawer-backdrop"><aside className="side-drawer"><button className="drawer-close" onClick={onClose}><X size={19} /></button><div className="eyebrow compact"><i /> RECORD DETAIL</div><h2>{row.name || row.employee_code || row.vendor_code || 'Selected record'}</h2><div className="detail-list">{Object.entries(row).map(([key, value]) => <div key={key}><span>{prettyKey(key)}</span><b className={key.includes('id') || key.includes('code') ? 'mono' : ''}>{stringValue(value)}</b></div>)}</div></aside></div>; }
 function DocumentDrawer({ document, details, user, onClose, toast }: { document: any; details: ApiEnvelope<any> | null; user: LocalUser; onClose: () => void; toast: (message: string, type?: Toast['type']) => void }) { const [text, setText] = useState<ApiEnvelope<any> | null>(null); const [chunks, setChunks] = useState<ApiEnvelope<any> | null>(null); const id = document.document_id || document.id; const fetchText = async () => { try { setText(await api.get(`/api/documents/${id}/extracted-text`, user.role)); } catch (e) { toast(e instanceof Error ? e.message : 'Extracted text unavailable.', 'error'); } }; const fetchChunks = async () => { try { setChunks(await api.get(`/api/rag/documents/${id}/chunks?limit=50`, user.role)); } catch (e) { toast(e instanceof Error ? e.message : 'Chunk detail unavailable.', 'error'); } };
