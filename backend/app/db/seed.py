@@ -17,6 +17,7 @@ from app.db.session import get_session_factory
 from app.models import (
     Customer,
     Employee,
+    EmployeeExperience,
     EmployeePermission,
     Product,
     ProductVendorMapping,
@@ -41,6 +42,7 @@ def seed_phase_two_data() -> dict[str, int]:
     created = {
         "employees": 0,
         "employee_permissions": 0,
+        "employee_experiences": 0,
         "vendors": 0,
         "customers": 0,
         "products": 0,
@@ -82,6 +84,74 @@ def seed_phase_two_data() -> dict[str, int]:
                 {"description": description, "is_active": True},
             )
             created["employee_permissions"] += int(was_created)
+
+        experience_rows = [
+            (
+                "EMP-102",
+                "Southline Finance Services",
+                "Accounts Analyst",
+                date(2021, 6, 1),
+                {
+                    "employment_type": "full_time",
+                    "location": "Bangalore",
+                    "end_date": date(2023, 12, 31),
+                    "description": "Handled monthly reconciliation and financial reporting.",
+                    "is_current": False,
+                },
+            ),
+            (
+                "EMP-103",
+                "Cloudbridge Technologies",
+                "Python Developer",
+                date(2020, 7, 1),
+                {
+                    "employment_type": "full_time",
+                    "location": "Kochi",
+                    "end_date": date(2023, 8, 31),
+                    "description": "Built internal automation and data-processing services.",
+                    "is_current": False,
+                },
+            ),
+            (
+                "EMP-105",
+                "PeopleFirst Consulting",
+                "HR Associate",
+                date(2022, 1, 10),
+                {
+                    "employment_type": "full_time",
+                    "location": "Bangalore",
+                    "end_date": date(2024, 3, 15),
+                    "description": "Supported recruitment operations and employee onboarding.",
+                    "is_current": False,
+                },
+            ),
+            (
+                "EMP-109",
+                "DataArc Systems",
+                "Software Engineer",
+                date(2019, 5, 1),
+                {
+                    "employment_type": "full_time",
+                    "location": "Hyderabad",
+                    "end_date": date(2022, 11, 30),
+                    "description": "Developed backend APIs and database integrations.",
+                    "is_current": False,
+                },
+            ),
+        ]
+        for employee_code, company_name, job_title, start_date, defaults in experience_rows:
+            experience, was_created = _get_or_create(
+                session,
+                EmployeeExperience,
+                {
+                    "employee_id": employees[employee_code].id,
+                    "company_name": company_name,
+                    "job_title": job_title,
+                    "start_date": start_date,
+                },
+                defaults,
+            )
+            created["employee_experiences"] += int(was_created)
 
         vendor_rows = [
             ("VND-001", {"vendor_name": "Neolotex Systems", "contact_email": "contact@neolotexsystems.local", "phone": "8000000001", "city": "Bangalore", "country": "India", "category": "Textile Automation", "status": "active"}),
@@ -157,7 +227,7 @@ def main() -> None:
     print("Phase 2 seed completed successfully.")
     for name, count in created.items():
         print(f"- {name}: {count} new record(s)")
-    print("Verification cases: EMP-101 has 0 permissions, EMP-102 has 1, EMP-103 has 3.")
+    print("Verification cases: EMP-101 has 0 permissions, EMP-103 has 3, and employee work-history rows are available.")
 
 
 if __name__ == "__main__":

@@ -457,6 +457,24 @@ class LLMService:
             "business_tables": list(BUSINESS_TABLES),
             "tables": tables,
             "relationships": relationships,
+            "parent_child_relationships": [
+                {
+                    "parent_table": "employees",
+                    "child_table": "employee_permissions",
+                    "parent_key": "employees.id",
+                    "child_key": "employee_permissions.employee_id",
+                    "cardinality": "one_to_zero_or_many",
+                    "delete_rule": "RESTRICT",
+                },
+                {
+                    "parent_table": "employees",
+                    "child_table": "employee_experiences",
+                    "parent_key": "employees.id",
+                    "child_key": "employee_experiences.employee_id",
+                    "cardinality": "one_to_zero_or_many",
+                    "delete_rule": "RESTRICT",
+                },
+            ],
             "feature_17": {
                 "parent_table": "employees",
                 "child_table": "employee_permissions",

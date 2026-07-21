@@ -840,3 +840,121 @@ button:focus-visible,
 /* Action-aware conversation memory: show the exact referenced batch inline. */
 .resolved-records{display:grid;gap:7px;margin-top:12px;padding-top:11px;border-top:1px solid rgba(148,163,184,.1)}
 .resolved-records>small{color:#8fb5d6;font:600 9px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em}
+
+
+/* Relationship family visualization: show every approved child table for the selected parent. */
+.relation-family-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.relation-family-heading > div {
+  display: grid;
+  gap: 5px;
+}
+.relation-family-heading span {
+  color: #6585a1;
+  font: 600 9px 'JetBrains Mono', monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.relation-family-heading b {
+  color: #d8e8f5;
+  font-size: 12px;
+}
+.relation-family-visual {
+  display: grid;
+  grid-template-columns: minmax(190px, .7fr) minmax(125px, .35fr) minmax(310px, 1.4fr);
+  align-items: center;
+  gap: 18px;
+  padding: 12px 0 5px;
+}
+.relation-parent-node {
+  min-height: 134px;
+}
+.relation-node > span {
+  color: #5f7d97;
+  font: 500 8px 'JetBrains Mono', monospace;
+}
+.relation-family-link {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #7c9dbc;
+  font: 500 8px 'JetBrains Mono', monospace;
+  text-align: center;
+}
+.relation-family-link i {
+  position: relative;
+  width: 100%;
+  height: 1px;
+  background: linear-gradient(90deg, #4da3ff, #8b7bff);
+}
+.relation-family-link i::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: -4px;
+  border-left: 7px solid #8b7bff;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+.relation-child-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.relation-child-node {
+  width: 100%;
+  min-height: 128px;
+  cursor: pointer;
+  transition: transform .2s, border-color .2s, background .2s, box-shadow .2s;
+}
+.relation-child-node:hover {
+  transform: translateY(-2px);
+  border-color: rgba(139,123,255,.48);
+  background: rgba(139,123,255,.12);
+}
+.relation-child-node.selected {
+  border-color: rgba(139,123,255,.7);
+  background: linear-gradient(145deg, rgba(139,123,255,.18), rgba(77,163,255,.08));
+  box-shadow: 0 0 0 3px rgba(139,123,255,.06), 0 14px 35px rgba(0,0,0,.18);
+}
+.active-relation-caption b {
+  color: #a9d2f8;
+  font-family: 'JetBrains Mono', monospace;
+}
+@media (max-width: 900px) {
+  .relation-family-visual {
+    grid-template-columns: 1fr;
+  }
+  .relation-family-link {
+    min-height: 55px;
+  }
+  .relation-family-link i {
+    width: 1px;
+    height: 30px;
+    background: linear-gradient(180deg, #4da3ff, #8b7bff);
+  }
+  .relation-family-link i::after {
+    right: -3px;
+    top: auto;
+    bottom: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 7px solid #8b7bff;
+    border-bottom: 0;
+  }
+}
+@media (max-width: 620px) {
+  .relation-family-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .relation-child-grid {
+    grid-template-columns: 1fr;
+  }
+}

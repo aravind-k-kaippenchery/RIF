@@ -70,6 +70,12 @@ Resolved business glossary hints:
 Bounded short-term session context:
 {_json(memory_context or {"available": False, "events": []})}
 
+Context-use rule:
+- Interpret the current user question first and treat it as authoritative.
+- Reuse a prior table, filter, entity, or SQL detail only when the current question explicitly refers to earlier context with words such as it, them, those, previous, last, same, or again.
+- Never carry an older city, department, status, price, or table filter into a standalone new question.
+- Questions about whether a table/column exists are handled by deterministic schema metadata inspection and should not reach this SQL prompt.
+
 Controlled schema contract:
 {_json(schema_contract)}
 
@@ -99,13 +105,19 @@ For employees, prefer:
 employee_code, first_name, last_name, department, city, company_name, salary, employment_status
 
 For vendors, prefer:
-vendor_code, vendor_name, city, email, phone, company_name
+vendor_code, vendor_name, contact_email, phone, city, country, category, status
 
 For customers, prefer:
-customer_code, customer_name, city, email, phone, company_name
+customer_code, customer_name, contact_email, phone, city, country, industry, status
 
 For products, prefer:
-product_code, product_name, category, price, vendor_id
+product_code, product_name, category, description, list_price, is_active
+
+For product_vendor_mappings, prefer:
+product_id, vendor_id, vendor_sku, quoted_price, is_preferred
+
+For sales_deals, prefer:
+deal_code, title, customer_id, product_id, owner_employee_id, amount, stage, probability, expected_close_date, status
 
 Example question:
 Show employees from Bangalore

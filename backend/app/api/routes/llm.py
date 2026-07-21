@@ -18,6 +18,10 @@ from app.schemas.phase5 import (
     SQLGenerationRequest,
 )
 from app.services.llm_service import LLMOutputValidationError, LLMServiceError, OllamaUnavailableError, llm_service
+from app.services.request_clarification_service import (
+    analyze_request_clarity,
+    assert_generated_tables_match,
+)
 
 router = APIRouter(prefix="/api/llm", tags=["Local LLM"])
 
@@ -78,10 +82,52 @@ def classify_intent(payload: IntentClassificationRequest, request: Request):
 
 @router.post("/generate-sql", summary="Generate and safety-validate a SQL proposal without executing it")
 def generate_sql(payload: SQLGenerationRequest, request: Request):
+    clarity = analyze_request_clarity(payload.question)
+    if clarity.needs_clarification:
+        return ResponseBuilder.success(
+            request,
+            status=ResponseStatus.CLARIFICATION_REQUIRED,
+            answer=clarity.message or "Please clarify the request.",
+            data={
+                "clarification": clarity.to_data(),
+                "execution_allowed": False,
+            },
+            generated_sql=None,
+        )
+
     try:
         proposal, validation, metadata, glossary = llm_service.generate_sql(payload.question, payload.route)
     except LLMServiceError as exc:
         _raise_llm_error(exc)
+
+    try:
+        assert_generated_tables_match(
+            expected_tables=clarity.resolved_tables,
+            generated_tables=list(validation.tables or []),
+        )
+    except ValueError:
+        return ResponseBuilder.success(
+            request,
+            status=ResponseStatus.CLARIFICATION_REQUIRED,
+            answer=(
+                "The generated SQL did not use the table explicitly requested, so it was rejected. "
+                "Please restate the target table and exact operation or filter."
+            ),
+            data={
+                "clarification": {
+                    "clarification_code": "generated_sql_table_mismatch",
+                    "missing_fields": ["target_table", "operation_or_filter"],
+                    "resolved_tables": list(clarity.resolved_tables),
+                    "generated_tables": list(validation.tables or []),
+                    "ollama_called": True,
+                    "sql_generated": False,
+                    "database_touched": False,
+                },
+                "execution_allowed": False,
+            },
+            generated_sql=None,
+        )
+
     return ResponseBuilder.success(
         request,
         answer="Local LLM generated a SQL proposal and the Phase 4 validator approved it. No SQL was executed.",
@@ -91,6 +137,7 @@ def generate_sql(payload: SQLGenerationRequest, request: Request):
             "glossary": glossary,
             "model_metadata": metadata.model_dump(),
             "execution_allowed": False,
+            "explicit_target_tables": list(clarity.resolved_tables),
         },
         generated_sql=validation.normalized_sql,
     )

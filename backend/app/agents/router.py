@@ -23,7 +23,7 @@ class RouteDecision:
 
 
 _WRITE_VERBS = {
-    "add", "create", "insert", "update", "delete", "remove", "change", "modify", "set", "rename",
+    "add", "create", "insert", "generate", "seed", "populate", "make", "update", "delete", "remove", "change", "modify", "set", "rename",
 }
 _DOCUMENT_TERMS = {
     "brochure", "document", "documents", "manual", "specification", "specifications", "warranty",
@@ -31,7 +31,7 @@ _DOCUMENT_TERMS = {
 }
 _DATABASE_TERMS = {
     "employee", "employees", "worker", "workers", "vendor", "vendors", "supplier", "suppliers",
-    "customer", "customers", "deal", "deals", "sales", "salary", "city", "department", "price", "prices",
+    "customer", "customers", "client", "clients", "product", "products", "permission", "permissions", "experience", "experiences", "history", "mapping", "mappings", "deal", "deals", "sales", "salary", "city", "department", "price", "prices",
     "revenue", "record", "records", "table", "tables", "under", "below", "above", "top", "highest",
 }
 _HYBRID_DATABASE_TERMS = {

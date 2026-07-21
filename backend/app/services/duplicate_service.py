@@ -18,6 +18,7 @@ from app.models import Base
 UNIQUE_KEY_SETS: dict[str, list[tuple[str, ...]]] = {
     "employees": [("employee_code",), ("email",), ("phone",)],
     "employee_permissions": [("employee_id", "permission_code")],
+    "employee_experiences": [("employee_id", "company_name", "job_title", "start_date")],
     "vendors": [("vendor_code",), ("vendor_name",), ("contact_email",), ("phone",)],
     "customers": [("customer_code",), ("customer_name",), ("contact_email",), ("phone",)],
     "products": [("product_code",), ("product_name",)],

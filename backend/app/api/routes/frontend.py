@@ -25,7 +25,12 @@ from app.db.session import get_db_session
 from app.mcp.client import LocalMCPClient
 from app.schemas.phase13 import FrontendQueryRequest
 from app.models.operations import ActionLog, QueryLog
-from app.services.session_memory_service import build_memory_context, get_session_history, write_agent_memory_event
+from app.services.session_memory_service import (
+    build_memory_context,
+    get_session_history,
+    memory_context_for_question,
+    write_agent_memory_event,
+)
 from app.services.conversation_context_service import (
     conversation_reference_from_result,
     resolve_conversation_followup,
@@ -86,6 +91,7 @@ def frontend_query(
     # session ID in both the JSON envelope and the response header.
     request.state.session_id = str(session.id)
     memory_context = build_memory_context(db, session_id=session.id)
+    model_memory_context = memory_context_for_question(payload.question, memory_context)
     started = perf_counter()
 
     # Resolve vague references deterministically before routing to Ollama/SQL.  This is
@@ -139,7 +145,7 @@ def frontend_query(
             session_id=str(session.id),
             user_role=role,
             top_k=payload.top_k,
-            memory_context=memory_context,
+            memory_context=model_memory_context,
         )
     except AgentOrchestrationError as exc:
         # Failed requests are part of conversation state.  Without this event, a later
@@ -184,7 +190,8 @@ def frontend_query(
         "session_id": str(session.id),
         "created_for_request": payload.session_id is None,
         "memory_context_event_count": memory_context["event_count"],
-        "memory_policy": memory_context["policy"],
+        "model_memory_event_count": model_memory_context["event_count"],
+        "memory_policy": model_memory_context["policy"],
         "memory_log": memory_audit,
     }
     return ResponseBuilder.success(

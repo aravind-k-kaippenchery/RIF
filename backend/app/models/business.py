@@ -36,6 +36,12 @@ class Employee(TimestampMixin, Base):
         cascade="save-update, merge",
         passive_deletes=True,
     )
+    experiences: Mapped[list[EmployeeExperience]] = relationship(
+        back_populates="employee",
+        cascade="save-update, merge",
+        passive_deletes=True,
+        order_by="EmployeeExperience.start_date.desc()",
+    )
     owned_sales_deals: Mapped[list[SalesDeal]] = relationship(back_populates="owner_employee")
 
     @property
@@ -60,6 +66,60 @@ class EmployeePermission(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
     employee: Mapped[Employee] = relationship(back_populates="permissions")
+
+
+class EmployeeExperience(TimestampMixin, Base):
+    """One previous/current employment record belonging to an employee.
+
+    The parent employee is protected with ``ON DELETE RESTRICT`` so work-history
+    records cannot disappear accidentally when an employee is removed.
+    """
+
+    __tablename__ = "employee_experiences"
+    __table_args__ = (
+        UniqueConstraint(
+            "employee_id",
+            "company_name",
+            "job_title",
+            "start_date",
+            name="uq_employee_experiences_employee_company_role_start",
+        ),
+        CheckConstraint(
+            "end_date IS NULL OR end_date >= start_date",
+            name="ck_employee_experiences_end_after_start",
+        ),
+        CheckConstraint(
+            "is_current = false OR end_date IS NULL",
+            name="ck_employee_experiences_current_has_no_end_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(
+        ForeignKey("employees.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    company_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    job_title: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    employment_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="full_time",
+        server_default="full_time",
+    )
+    location: Mapped[Optional[str]] = mapped_column(String(160), index=True)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    end_date: Mapped[Optional[date]] = mapped_column(Date, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    is_current: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+
+    employee: Mapped[Employee] = relationship(back_populates="experiences")
 
 
 class Vendor(TimestampMixin, Base):

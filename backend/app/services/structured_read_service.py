@@ -368,6 +368,7 @@ class StructuredReadService:
         request_id: str | None = None,
         session_id: str | None = None,
         memory_context: dict[str, Any] | None = None,
+        expected_tables: list[str] | None = None,
     ) -> StructuredReadResult:
         """Run one LLM-proposed, validator-approved SELECT through the MCP tool boundary."""
 
@@ -378,6 +379,26 @@ class StructuredReadService:
             AgentRoute.STRUCTURED_READ.value,
             memory_context=memory_context,
         )
+
+        explicit_tables = {
+            str(table).strip().lower()
+            for table in (expected_tables or [])
+            if str(table).strip()
+        }
+        generated_tables = {
+            str(table).strip().lower()
+            for table in (initial_validation.tables or [])
+            if str(table).strip()
+        }
+        if explicit_tables and not explicit_tables.issubset(generated_tables):
+            raise StructuredReadError(
+                status=ResponseStatus.CLARIFICATION_REQUIRED,
+                code="generated_read_table_mismatch",
+                message=(
+                    "The generated query did not use the table you explicitly requested, so I rejected it before database execution. "
+                    "Please restate the target table and filter."
+                ),
+            )
 
         outcome = self._mcp_client.call_tool(
             "execute_validated_read",

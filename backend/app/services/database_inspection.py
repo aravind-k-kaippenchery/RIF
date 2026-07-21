@@ -11,6 +11,7 @@ from app.models import (
     Document,
     DocumentIngestionJob,
     Employee,
+    EmployeeExperience,
     EmployeePermission,
     PendingAction,
     Product,
@@ -26,6 +27,7 @@ from app.models import (
 APPLICATION_TABLES = [
     "employees",
     "employee_permissions",
+    "employee_experiences",
     "vendors",
     "customers",
     "products",
@@ -56,6 +58,7 @@ def get_table_summary(session: Session) -> dict:
     models = {
         "employees": Employee,
         "employee_permissions": EmployeePermission,
+        "employee_experiences": EmployeeExperience,
         "vendors": Vendor,
         "customers": Customer,
         "products": Product,
@@ -82,7 +85,7 @@ def get_table_summary(session: Session) -> dict:
     return {
         "record_counts": counts,
         "feature_17_verification": {
-            "relationship": "employees → employee_permissions",
+            "relationship": "employees → employee_permissions and employee_experiences",
             "EMP-101_expected_permissions": 0,
             "EMP-102_expected_permissions": 1,
             "EMP-103_expected_permissions": 3,

@@ -13,7 +13,7 @@ client = TestClient(create_app())
 def test_schema_contract_contains_business_and_operational_tables():
     contract = get_schema_contract()
 
-    assert contract["table_count"] == 16
+    assert contract["table_count"] == 17
     assert "employees" in contract["business_tables"]
     assert "pending_actions" in contract["operational_tables"]
     assert contract["feature_17"]["parent_table"] == "employees"

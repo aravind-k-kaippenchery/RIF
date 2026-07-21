@@ -17,6 +17,7 @@ from app.schemas.phase7 import (
     BulkWriteProposalRequest,
     PendingActionMutationRequest,
     PromptWriteProposalRequest,
+    SyntheticDataProposalRequest,
     SyntheticEmployeeProposalRequest,
     WriteProposalRequest,
 )
@@ -26,6 +27,12 @@ from app.services.synthetic_employee_service import (
     SyntheticEmployeeGenerationError,
     SyntheticEmployeeRequest,
     generate_synthetic_employees,
+)
+from app.services.synthetic_data_service import (
+    SyntheticDataGenerationError,
+    SyntheticDataRequest,
+    generate_synthetic_records,
+    supported_synthetic_tables,
 )
 
 router = APIRouter(prefix="/api/crud", tags=["Confirmation-gated CRUD"])
@@ -145,6 +152,66 @@ def propose_bulk_insert(
     except CrudWriteError as exc:
         _raise_crud_error(exc)
     return _proposal_response(request, result, answer="Bulk insert preview created after duplicate checks. No database rows were inserted.")
+
+
+@router.post("/generate-propose", summary="Generate schema-aware synthetic records for any approved business table, then create a confirmation preview")
+def propose_synthetic_data_batch(
+    payload: SyntheticDataProposalRequest,
+    request: Request,
+    db: Session = Depends(get_db_session),
+    role: UserRole = Depends(get_current_role),
+):
+    try:
+        batch = generate_synthetic_records(
+            db,
+            SyntheticDataRequest(
+                target_table=payload.target_table,
+                count=payload.count,
+                constraints=payload.constraints,
+                source_text=payload.user_prompt,
+            ),
+        )
+        result = crud_write_service.propose_bulk_insert(
+            db,
+            session_id=payload.session_id,
+            target_table=batch.target_table,
+            records=batch.records,
+            actor_role=role,
+            user_prompt=payload.user_prompt or f"Generate synthetic records for {batch.target_table} with Faker.",
+            ttl_minutes=payload.ttl_minutes,
+            generation_metadata=batch.metadata,
+        )
+    except SyntheticDataGenerationError as exc:
+        raise AppError(
+            status=ResponseStatus.CLARIFICATION_REQUIRED,
+            code=exc.code,
+            message=exc.message,
+            http_status_code=HTTP_400_BAD_REQUEST,
+            details=exc.details,
+        ) from exc
+    except CrudWriteError as exc:
+        _raise_crud_error(exc)
+
+    readable_table = batch.target_table.replace("_", " ")
+    return _proposal_response(
+        request,
+        result,
+        answer=(
+            f"Generated {len(batch.records)} synthetic {readable_table} record"
+            f"{'s' if len(batch.records) != 1 else ''} with Faker. No database rows were inserted; confirmation is required."
+        ),
+        extra_data={
+            "target_table": batch.target_table,
+            "requested_record_count": payload.count,
+            "generated_record_count": len(batch.records),
+            "preview_record_count": result.preview.get("record_count"),
+            "count_verified": payload.count == len(batch.records) == int(result.preview.get("record_count") or 0),
+            "rows": result.preview.get("records", []),
+            "generator": "faker",
+            "synthetic_generation": batch.metadata,
+            "supported_synthetic_tables": supported_synthetic_tables(),
+        },
+    )
 
 
 @router.post("/generate-employees-propose", summary="Generate synthetic employees with Faker, then create the usual duplicate-checked bulk confirmation preview")

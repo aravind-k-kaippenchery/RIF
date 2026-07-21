@@ -10,7 +10,8 @@ request body.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -29,7 +30,7 @@ from app.services.duplicate_service import (
     json_safe,
     row_to_dict,
 )
-from app.services.schema_registry import BUSINESS_TABLES, get_allowed_columns
+from app.services.schema_registry import BUSINESS_TABLES, get_allowed_columns, get_relationships
 from app.services.session_service import (
     _utc_now,
     create_pending_action,
@@ -234,6 +235,43 @@ class CrudWriteService:
                 )
 
     @staticmethod
+    def _json_safe_record(record: dict[str, Any]) -> dict[str, Any]:
+        return {str(key): json_safe(value) for key, value in record.items()}
+
+    @staticmethod
+    def _coerce_stored_value(column: Any, value: Any) -> Any:
+        """Restore JSONB-safe values to the Python type expected by SQLAlchemy."""
+
+        if value is None:
+            return None
+        try:
+            python_type = column.type.python_type
+        except (AttributeError, NotImplementedError):
+            return value
+        if python_type is date and not isinstance(value, date):
+            return date.fromisoformat(str(value))
+        if python_type is datetime and not isinstance(value, datetime):
+            return datetime.fromisoformat(str(value))
+        if python_type is Decimal and not isinstance(value, Decimal):
+            return Decimal(str(value))
+        if python_type is bool and not isinstance(value, bool):
+            normalized = str(value).strip().casefold()
+            if normalized in {"true", "1", "yes"}:
+                return True
+            if normalized in {"false", "0", "no"}:
+                return False
+        if python_type is int and not isinstance(value, bool):
+            return int(value)
+        return value
+
+    @classmethod
+    def _coerce_stored_record(cls, table: Any, record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: cls._coerce_stored_value(table.c[key], value) if key in table.c else value
+            for key, value in record.items()
+        }
+
+    @staticmethod
     def _expected_bulk_count(
         records: list[dict[str, Any]],
         *,
@@ -340,14 +378,70 @@ class CrudWriteService:
         return changes
 
     def _employee_child_preview(self, db: DbSession, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not rows:
-            return []
+        """Backward-compatible employee-child preview used by existing Phase 7 tests.
+
+        New code uses metadata-driven relationship protection, but retaining this helper
+        keeps older integrations stable while also including employee experiences.
+        """
+
         ids = [row.get("id") for row in rows if row.get("id") is not None]
         if not ids:
             return []
-        permissions = Base.metadata.tables["employee_permissions"]
-        child_rows = [row_to_dict(row) for row in db.execute(select(permissions).where(permissions.c.employee_id.in_(ids))).mappings().all()]
+        child_rows: list[dict[str, Any]] = []
+        for table_name in ("employee_permissions", "employee_experiences"):
+            table = Base.metadata.tables.get(table_name)
+            if table is None or "employee_id" not in table.c:
+                continue
+            for row in db.execute(select(table).where(table.c.employee_id.in_(ids))).mappings().all():
+                child_rows.append({"child_table": table_name, **row_to_dict(row)})
         return child_rows
+
+    def _restricting_child_records(
+        self,
+        db: DbSession,
+        *,
+        parent_table: str,
+        parent_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return child records protected by ON DELETE RESTRICT for any business parent.
+
+        Relationship metadata is the source of truth, so new approved child tables are
+        protected without another employee-specific branch.
+        """
+
+        parent_ids = [row.get("id") for row in parent_rows if row.get("id") is not None]
+        if not parent_ids:
+            return []
+        details: list[dict[str, Any]] = []
+        for relationship in get_relationships():
+            if relationship.get("to_table") != parent_table:
+                continue
+            if str(relationship.get("delete_rule") or "").upper() != "RESTRICT":
+                continue
+            child_table_name = str(relationship.get("from_table") or "")
+            child_column_name = str(relationship.get("from_column") or "")
+            child_table = Base.metadata.tables.get(child_table_name)
+            if child_table is None or child_column_name not in child_table.c:
+                continue
+            rows = [
+                row_to_dict(row)
+                for row in db.execute(
+                    select(child_table)
+                    .where(child_table.c[child_column_name].in_(parent_ids))
+                    .limit(MAX_PREVIEW_ROWS + 1)
+                ).mappings().all()
+            ]
+            if rows:
+                details.append(
+                    {
+                        "child_table": child_table_name,
+                        "child_foreign_key": child_column_name,
+                        "delete_rule": "RESTRICT",
+                        "record_count": len(rows),
+                        "records": rows[:MAX_PREVIEW_ROWS],
+                    }
+                )
+        return details
 
     @staticmethod
     def _summary(action_type: str, target_table: str, affected_count: int) -> str:
@@ -456,14 +550,22 @@ class CrudWriteService:
         else:
             affected_rows = self._affected_rows(db, target_table=target_table, expression=expression)
             child_rows: list[dict[str, Any]] = []
-            if statement_type == "DELETE" and target_table == "employees":
-                child_rows = self._employee_child_preview(db, affected_rows)
+            if statement_type == "DELETE":
+                child_rows = self._restricting_child_records(
+                    db,
+                    parent_table=target_table,
+                    parent_rows=affected_rows,
+                )
+                if target_table == "employees" and not child_rows:
+                    legacy_rows = self._employee_child_preview(db, affected_rows)
+                    if legacy_rows:
+                        child_rows = [{"child_table": "employee_children", "delete_rule": "RESTRICT", "records": legacy_rows}]
                 if child_rows:
                     raise CrudWriteError(
                         status=ResponseStatus.CLARIFICATION_REQUIRED,
                         code="parent_child_records_exist",
-                        message="The requested employee deletion is blocked because child permission records exist. Resolve the child records first.",
-                        details=[{"parent_records": affected_rows, "child_records": child_rows, "delete_rule": "RESTRICT"}],
+                        message="Deletion is blocked because related child records use ON DELETE RESTRICT. Resolve those child records first.",
+                        details=[{"parent_records": affected_rows, "child_relationships": child_rows}],
                     )
             preview = {
                 "summary": self._summary(statement_type, target_table, len(affected_rows)),
@@ -520,6 +622,7 @@ class CrudWriteService:
         metadata = dict(generation_metadata or {})
         requested_count = self._expected_bulk_count(records, generation_metadata=metadata)
         generated_count = len(records)
+        stored_records = [self._json_safe_record(record) for record in records]
         count_contract = {
             "requested_record_count": requested_count,
             "generated_record_count": generated_count,
@@ -562,7 +665,7 @@ class CrudWriteService:
             "requested_record_count": requested_count,
             "generated_record_count": generated_count,
             "preview_record_count": generated_count,
-            "records": records,
+            "records": stored_records,
             "duplicate_check": {"status": "clear", "checked_record_count": generated_count},
             "generation_metadata": metadata,
             "count_contract": count_contract,
@@ -576,10 +679,141 @@ class CrudWriteService:
                 "mode": "bulk_records",
                 "statement_type": "INSERT",
                 "target_table": target_table,
-                "records": records,
+                "records": stored_records,
                 "user_prompt": user_prompt,
                 "generation_metadata": metadata,
                 "count_contract": count_contract,
+            },
+            preview_data=preview,
+            generated_sql=None,
+            ttl_minutes=ttl_minutes,
+        )
+        return WriteProposalResult(
+            pending_action=pending_action_to_dict(action),
+            validation=None,
+            preview=preview,
+            duplicate_matches=[],
+            generated_sql=None,
+        )
+
+    def propose_structured_write(
+        self,
+        db: DbSession,
+        *,
+        session_id: UUID,
+        target_table: str,
+        statement_type: str,
+        record_ids: list[int],
+        changes: dict[str, Any] | None,
+        actor_role: UserRole,
+        user_prompt: str | None = None,
+        ttl_minutes: int = 30,
+    ) -> WriteProposalResult:
+        """Create a confirmation preview for a backend-compiled UPDATE or DELETE.
+
+        This path is used by semantic parent-child CRUD. It accepts only resolved primary
+        keys and validated literal changes; no model-generated SQL is stored or executed.
+        """
+
+        self._require_session(db, session_id, actor_role)
+        normalized_table = target_table.strip().lower()
+        table = self._business_table(normalized_table)
+        operation = statement_type.strip().upper()
+        if operation not in {"UPDATE", "DELETE"}:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="structured_write_operation_invalid",
+                message="Structured writes support UPDATE or DELETE only.",
+            )
+        normalized_ids = sorted({int(value) for value in record_ids if int(value) > 0})
+        if not normalized_ids:
+            raise CrudWriteError(
+                status=ResponseStatus.CLARIFICATION_REQUIRED,
+                code="structured_write_record_ids_required",
+                message="No exact records were selected for the requested write.",
+            )
+        if len(normalized_ids) > MAX_PREVIEW_ROWS:
+            raise CrudWriteError(
+                status=ResponseStatus.CLARIFICATION_REQUIRED,
+                code="too_many_affected_rows",
+                message=f"The requested write selects more than {MAX_PREVIEW_ROWS} records. Narrow the request first.",
+            )
+
+        before_rows = [
+            row_to_dict(row)
+            for row in db.execute(
+                select(table).where(table.c.id.in_(normalized_ids)).order_by(table.c.id)
+            ).mappings().all()
+        ]
+        if len(before_rows) != len(normalized_ids):
+            found_ids = {int(row["id"]) for row in before_rows if row.get("id") is not None}
+            missing_ids = [value for value in normalized_ids if value not in found_ids]
+            raise CrudWriteError(
+                status=ResponseStatus.INFORMATION_NOT_AVAILABLE,
+                code="structured_write_records_missing",
+                message="One or more selected records no longer exist. Create a new preview.",
+                details=[{"missing_record_ids": missing_ids}],
+            )
+
+        normalized_changes: dict[str, Any] = {}
+        if operation == "UPDATE":
+            raw_changes = dict(changes or {})
+            if not raw_changes:
+                raise CrudWriteError(
+                    status=ResponseStatus.CLARIFICATION_REQUIRED,
+                    code="structured_write_changes_required",
+                    message="Which field should be changed, and what should its new value be?",
+                )
+            allowed = set(get_allowed_columns(normalized_table)) - MANAGED_COLUMNS
+            foreign_key_columns = {column.name for column in table.columns if column.foreign_keys}
+            invalid = sorted(set(raw_changes) - allowed)
+            reparenting = sorted(set(raw_changes) & foreign_key_columns)
+            if invalid or reparenting:
+                raise CrudWriteError(
+                    status=ResponseStatus.CLARIFICATION_REQUIRED,
+                    code="structured_write_fields_invalid",
+                    message="The requested update contains an unknown, managed, or relationship key field.",
+                    details=[{"invalid_fields": invalid, "relationship_fields_blocked": reparenting}],
+                )
+            normalized_changes = raw_changes
+
+        child_relationships: list[dict[str, Any]] = []
+        if operation == "DELETE":
+            child_relationships = self._restricting_child_records(
+                db,
+                parent_table=normalized_table,
+                parent_rows=before_rows,
+            )
+            if child_relationships:
+                raise CrudWriteError(
+                    status=ResponseStatus.CLARIFICATION_REQUIRED,
+                    code="parent_child_records_exist",
+                    message="Deletion is blocked because related child records use ON DELETE RESTRICT. Resolve those child records first.",
+                    details=[{"parent_records": before_rows, "child_relationships": child_relationships}],
+                )
+
+        preview = {
+            "summary": self._summary(operation, normalized_table, len(before_rows)),
+            "requires_confirmation": True,
+            "affected_row_count": len(before_rows),
+            "affected_rows": before_rows,
+            "changes": {key: json_safe(value) for key, value in normalized_changes.items()},
+            "child_records": child_relationships,
+            "snapshot_plan": ["before", "after"] if operation == "UPDATE" else ["before"],
+            "execution_mode": "structured_relationship",
+        }
+        action = create_pending_action(
+            db,
+            session_id=session_id,
+            action_type=operation.lower(),
+            target_table=normalized_table,
+            validated_payload={
+                "mode": "structured_relationship",
+                "statement_type": operation,
+                "target_table": normalized_table,
+                "record_ids": normalized_ids,
+                "changes": {key: json_safe(value) for key, value in normalized_changes.items()},
+                "user_prompt": user_prompt,
             },
             preview_data=preview,
             generated_sql=None,
@@ -733,14 +967,22 @@ class CrudWriteService:
                 statement_type = self._statement_type(expression)
                 if statement_type in {"UPDATE", "DELETE"}:
                     before_rows = self._affected_rows(db, target_table=target_table, expression=expression)
-                    if statement_type == "DELETE" and target_table == "employees":
-                        child_rows = self._employee_child_preview(db, before_rows)
+                    if statement_type == "DELETE":
+                        child_rows = self._restricting_child_records(
+                            db,
+                            parent_table=target_table,
+                            parent_rows=before_rows,
+                        )
+                        if target_table == "employees" and not child_rows:
+                            legacy_rows = self._employee_child_preview(db, before_rows)
+                            if legacy_rows:
+                                child_rows = [{"child_table": "employee_children", "delete_rule": "RESTRICT", "records": legacy_rows}]
                         if child_rows:
                             raise CrudWriteError(
                                 status=ResponseStatus.CLARIFICATION_REQUIRED,
                                 code="parent_child_records_exist",
-                                message="Deletion is blocked because child permission records exist.",
-                                details=[{"parent_records": before_rows, "child_records": child_rows, "delete_rule": "RESTRICT"}],
+                                message="Deletion is blocked because related child records use ON DELETE RESTRICT.",
+                                details=[{"parent_records": before_rows, "child_relationships": child_rows}],
                             )
                 action_log = self._create_action_log(
                     db,
@@ -771,7 +1013,7 @@ class CrudWriteService:
                 records = payload.get("records")
                 if not isinstance(records, list) or not records or not all(isinstance(record, dict) for record in records):
                     raise CrudWriteError(status=ResponseStatus.VALIDATION_FAILED, code="stored_bulk_records_missing", message="The stored bulk record payload is invalid.")
-                records = [dict(record) for record in records]
+                records = [self._coerce_stored_record(table, dict(record)) for record in records]
                 generation_metadata = payload.get("generation_metadata") if isinstance(payload.get("generation_metadata"), dict) else {}
                 count_contract = payload.get("count_contract") if isinstance(payload.get("count_contract"), dict) else {}
                 expected_row_count = self._expected_bulk_count(
@@ -826,6 +1068,86 @@ class CrudWriteService:
                 for index, record in enumerate(after_rows):
                     snapshot_record = {**record, "record_index": index}
                     self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=snapshot_record, snapshot_type="after")
+            elif mode == "structured_relationship":
+                statement_type = str(payload.get("statement_type") or "").upper()
+                raw_ids = payload.get("record_ids")
+                record_ids = sorted({int(value) for value in raw_ids or [] if int(value) > 0}) if isinstance(raw_ids, list) else []
+                if statement_type not in {"UPDATE", "DELETE"} or not record_ids:
+                    raise CrudWriteError(
+                        status=ResponseStatus.VALIDATION_FAILED,
+                        code="stored_structured_relationship_invalid",
+                        message="The stored structured relationship action is invalid.",
+                    )
+                before_rows = [
+                    row_to_dict(row)
+                    for row in db.execute(
+                        select(table).where(table.c.id.in_(record_ids)).order_by(table.c.id).with_for_update()
+                    ).mappings().all()
+                ]
+                if len(before_rows) != len(record_ids):
+                    raise CrudWriteError(
+                        status=ResponseStatus.INFORMATION_NOT_AVAILABLE,
+                        code="structured_write_records_changed",
+                        message="One or more selected records changed or disappeared after preview. Create a new preview.",
+                    )
+                if statement_type == "DELETE":
+                    child_rows = self._restricting_child_records(
+                        db,
+                        parent_table=target_table,
+                        parent_rows=before_rows,
+                    )
+                    if child_rows:
+                        raise CrudWriteError(
+                            status=ResponseStatus.CLARIFICATION_REQUIRED,
+                            code="parent_child_records_exist",
+                            message="Deletion is blocked because related child records use ON DELETE RESTRICT.",
+                            details=[{"parent_records": before_rows, "child_relationships": child_rows}],
+                        )
+                action_log = self._create_action_log(
+                    db,
+                    request_id=request_id,
+                    session_id=session_id,
+                    pending_action_id=action.id,
+                    actor_role=actor_role,
+                    action_type=action.action_type,
+                    target_table=target_table,
+                    generated_sql=None,
+                    status="executing",
+                    confirmation_status="confirmed",
+                )
+                for row in before_rows:
+                    self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=row, snapshot_type="before")
+                if statement_type == "UPDATE":
+                    stored_changes = payload.get("changes") if isinstance(payload.get("changes"), dict) else {}
+                    changes = self._coerce_stored_record(table, dict(stored_changes))
+                    if not changes:
+                        raise CrudWriteError(
+                            status=ResponseStatus.VALIDATION_FAILED,
+                            code="stored_structured_changes_missing",
+                            message="The stored structured update contains no changes.",
+                        )
+                    update_result = db.execute(
+                        table.update()
+                        .where(table.c.id.in_(record_ids))
+                        .values(**changes)
+                        .returning(*table.columns)
+                    )
+                    after_rows = [row_to_dict(row) for row in update_result.mappings().all()]
+                    affected_count = len(after_rows)
+                    for row in after_rows:
+                        self._snapshot(db, action_log_id=action_log.id, table_name=target_table, record=row, snapshot_type="after")
+                else:
+                    delete_result = db.execute(
+                        table.delete().where(table.c.id.in_(record_ids))
+                    )
+                    affected_count = max(0, int(delete_result.rowcount or 0))
+                if affected_count != len(record_ids):
+                    raise CrudWriteError(
+                        status=ResponseStatus.TOOL_FAILED,
+                        code="structured_write_count_mismatch",
+                        message="The confirmed write affected a different number of records than the preview. The transaction was rolled back.",
+                        details=[{"preview_record_count": len(record_ids), "affected_row_count": affected_count}],
+                    )
             else:
                 raise CrudWriteError(status=ResponseStatus.VALIDATION_FAILED, code="unsupported_pending_action_mode", message="The pending action does not contain an executable Phase 7 payload.")
 

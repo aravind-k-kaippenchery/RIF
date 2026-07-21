@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowDown, LockKeyhole, RefreshCw, ShieldCheck, UsersRound } from 'lucide-react';
+import { ArrowDown, BriefcaseBusiness, LockKeyhole, RefreshCw, ShieldCheck, UsersRound } from 'lucide-react';
 import { api } from '../lib/api';
 import type { LocalUser } from '../lib/types';
 import { Empty, RecordTable, SectionHeading, StatusBadge, TableSkeleton, asRecord, stringValue } from '../App';
@@ -38,7 +38,13 @@ export default function RelationshipExplorerPage({ user, toast }: Props) {
           if (item.requires_admin_for_records || item.admin_only) restricted.add(item.table_name || item.name);
         });
         setRestrictedTables(restricted);
-        if (rels.length) setActiveRelation(rels.find((r: any) => r.to_table === 'employees') || rels[0]);
+        if (rels.length) {
+          setActiveRelation(
+            rels.find((r: any) => r.to_table === 'employees' && r.from_table === 'employee_experiences')
+              || rels.find((r: any) => r.to_table === 'employees')
+              || rels[0],
+          );
+        }
       } catch (e) {
         toast(e instanceof Error ? e.message : 'Could not load approved relationships.', 'error');
       } finally {
@@ -101,6 +107,18 @@ export default function RelationshipExplorerPage({ user, toast }: Props) {
 
   const isEmployeePermissions = activeRelation?.to_table === 'employees' && activeRelation?.from_table === 'employee_permissions';
 
+  const relationshipFamily = activeRelation
+    ? relationships.filter((relation: any) => (
+        relation.to_table === activeRelation.to_table
+        && relation.to_column === activeRelation.to_column
+      ))
+    : [];
+
+  const childIcon = (tableName: string) => {
+    if (tableName === 'employee_experiences') return <BriefcaseBusiness size={22} />;
+    return <ShieldCheck size={22} />;
+  };
+
   return (
     <div className="workflow-page page-enter">
       <section className="workflow-hero glow-panel">
@@ -125,12 +143,53 @@ export default function RelationshipExplorerPage({ user, toast }: Props) {
 
       {activeRelation && (
         <section className="relation-section surface-card">
-          <div className="relation-visual">
-            <div className="relation-node"><UsersRound size={22} /><b>{activeRelation.to_table}</b><small>Parent records</small></div>
-            <div className="relation-link"><span>one</span><i /><span>zero, one or many</span></div>
-            <div className="relation-node child"><ShieldCheck size={22} /><b>{activeRelation.from_table}</b><small>Child records via {activeRelation.from_column}</small></div>
+          <div className="relation-family-heading">
+            <div>
+              <span>Relationship family</span>
+              <b>{activeRelation.to_table} has {relationshipFamily.length} approved child {relationshipFamily.length === 1 ? 'table' : 'tables'}</b>
+            </div>
+            <StatusBadge status={`${relationshipFamily.length} CHILD RELATIONSHIPS`} />
           </div>
-          <p>{activeRelation.to_table}.{activeRelation.to_column} is referenced by {activeRelation.from_table}.{activeRelation.from_column} ({activeRelation.relationship_type || 'many_to_one'}, delete rule: {stringValue(activeRelation.delete_rule, 'none')}).</p>
+
+          <div className="relation-family-visual">
+            <div className="relation-node relation-parent-node">
+              <UsersRound size={24} />
+              <b>{activeRelation.to_table}</b>
+              <small>Parent records</small>
+              <span>Primary key: {activeRelation.to_column}</span>
+            </div>
+
+            <div className="relation-family-link" aria-hidden="true">
+              <span>one parent</span>
+              <i />
+              <span>zero, one or many children</span>
+            </div>
+
+            <div className="relation-child-grid">
+              {relationshipFamily.map((relation: any, index: number) => {
+                const selected = relation === activeRelation;
+                return (
+                  <button
+                    key={`${relation.from_table}-${relation.from_column}-${index}`}
+                    type="button"
+                    className={`relation-node child relation-child-node ${selected ? 'selected' : ''}`}
+                    onClick={() => setActiveRelation(relation)}
+                    aria-pressed={selected}
+                  >
+                    {childIcon(relation.from_table)}
+                    <b>{relation.from_table}</b>
+                    <small>Child records via {relation.from_column}</small>
+                    <span>{relation.relationship_type || 'many_to_one'} · delete {stringValue(relation.delete_rule, 'none')}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <p className="active-relation-caption">
+            Active relationship: <b>{activeRelation.to_table}.{activeRelation.to_column}</b> is referenced by <b>{activeRelation.from_table}.{activeRelation.from_column}</b>.
+            Select another child card above to browse its records.
+          </p>
         </section>
       )}
 
