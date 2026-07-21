@@ -17,7 +17,6 @@ from app.schemas.phase7 import (
     BulkWriteProposalRequest,
     PendingActionMutationRequest,
     PromptWriteProposalRequest,
-    SyntheticDataProposalRequest,
     SyntheticEmployeeProposalRequest,
     WriteProposalRequest,
 )
@@ -27,12 +26,6 @@ from app.services.synthetic_employee_service import (
     SyntheticEmployeeGenerationError,
     SyntheticEmployeeRequest,
     generate_synthetic_employees,
-)
-from app.services.synthetic_data_service import (
-    SyntheticDataGenerationError,
-    SyntheticDataRequest,
-    generate_synthetic_records,
-    supported_synthetic_tables,
 )
 
 router = APIRouter(prefix="/api/crud", tags=["Confirmation-gated CRUD"])
@@ -154,66 +147,6 @@ def propose_bulk_insert(
     return _proposal_response(request, result, answer="Bulk insert preview created after duplicate checks. No database rows were inserted.")
 
 
-@router.post("/generate-propose", summary="Generate schema-aware synthetic records for any approved business table, then create a confirmation preview")
-def propose_synthetic_data_batch(
-    payload: SyntheticDataProposalRequest,
-    request: Request,
-    db: Session = Depends(get_db_session),
-    role: UserRole = Depends(get_current_role),
-):
-    try:
-        batch = generate_synthetic_records(
-            db,
-            SyntheticDataRequest(
-                target_table=payload.target_table,
-                count=payload.count,
-                constraints=payload.constraints,
-                source_text=payload.user_prompt,
-            ),
-        )
-        result = crud_write_service.propose_bulk_insert(
-            db,
-            session_id=payload.session_id,
-            target_table=batch.target_table,
-            records=batch.records,
-            actor_role=role,
-            user_prompt=payload.user_prompt or f"Generate synthetic records for {batch.target_table} with Faker.",
-            ttl_minutes=payload.ttl_minutes,
-            generation_metadata=batch.metadata,
-        )
-    except SyntheticDataGenerationError as exc:
-        raise AppError(
-            status=ResponseStatus.CLARIFICATION_REQUIRED,
-            code=exc.code,
-            message=exc.message,
-            http_status_code=HTTP_400_BAD_REQUEST,
-            details=exc.details,
-        ) from exc
-    except CrudWriteError as exc:
-        _raise_crud_error(exc)
-
-    readable_table = batch.target_table.replace("_", " ")
-    return _proposal_response(
-        request,
-        result,
-        answer=(
-            f"Generated {len(batch.records)} synthetic {readable_table} record"
-            f"{'s' if len(batch.records) != 1 else ''} with Faker. No database rows were inserted; confirmation is required."
-        ),
-        extra_data={
-            "target_table": batch.target_table,
-            "requested_record_count": payload.count,
-            "generated_record_count": len(batch.records),
-            "preview_record_count": result.preview.get("record_count"),
-            "count_verified": payload.count == len(batch.records) == int(result.preview.get("record_count") or 0),
-            "rows": result.preview.get("records", []),
-            "generator": "faker",
-            "synthetic_generation": batch.metadata,
-            "supported_synthetic_tables": supported_synthetic_tables(),
-        },
-    )
-
-
 @router.post("/generate-employees-propose", summary="Generate synthetic employees with Faker, then create the usual duplicate-checked bulk confirmation preview")
 def propose_synthetic_employee_batch(
     payload: SyntheticEmployeeProposalRequest,
@@ -284,19 +217,32 @@ def confirm_write(
         raise AppError(status=ResponseStatus.VALIDATION_FAILED, code="invalid_pending_action_id", message="pending_action_id must be a UUID.", http_status_code=HTTP_400_BAD_REQUEST) from exc
     except CrudWriteError as exc:
         _raise_crud_error(exc)
+    record_word = "record" if result.affected_row_count == 1 else "records"
+    answer = (
+        "Confirmation was already processed earlier; no duplicate write was executed."
+        if result.idempotent
+        else f"Confirmed write executed successfully. Exactly {result.affected_row_count} {record_word} were affected, with audit logging and snapshots."
+    )
     return ResponseBuilder.success(
         request,
         route=AgentRoute.CRUD_WRITE,
-        answer=("Confirmation was already processed earlier; no duplicate write was executed." if result.idempotent else "Confirmed write executed successfully with audit logging and snapshots."),
+        answer=answer,
         data={
             "pending_action": result.pending_action,
             "action_log_id": result.action_log_id,
             "affected_row_count": result.affected_row_count,
+            "affected_record_ids": result.affected_record_ids,
+            "affected_records": result.affected_records,
+            "rows": result.affected_records,
             "before_snapshot_count": result.before_snapshot_count,
             "after_snapshot_count": result.after_snapshot_count,
+            "expected_row_count": result.expected_row_count,
+            "confirmed_record_count": result.affected_row_count,
+            "count_verified": result.count_verified,
             "idempotent": result.idempotent,
             "write_execution_allowed": True,
             "write_execution_mode": "confirmed_pending_action_only",
+            "next_step": "Use View created records to inspect the exact database rows affected by this confirmation.",
         },
         pending_action_id=result.pending_action["pending_action_id"],
     )

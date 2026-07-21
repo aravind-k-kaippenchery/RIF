@@ -1,4 +1,4 @@
-"""FastAPI application entry point for the B2B Product Intelligence Assistant."""
+﻿"""FastAPI application entry point for the B2B Product Intelligence Assistant."""
 
 from contextlib import asynccontextmanager
 
@@ -16,6 +16,7 @@ from app.api.routes.database import router as database_router
 from app.api.routes.documents import router as documents_router
 from app.api.routes.demo import router as demo_router
 from app.api.routes.health import router as health_router
+from app.api.routes.live_health import router as live_health_router
 from app.api.routes.hybrid import router as hybrid_router
 from app.api.routes.llm import router as llm_router
 from app.api.routes.mcp import router as mcp_router
@@ -88,6 +89,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health_router)
+    app.include_router(live_health_router)
     app.include_router(frontend_router)
     app.include_router(admin_schema_router)
     app.include_router(audit_router)
@@ -111,3 +113,4 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+

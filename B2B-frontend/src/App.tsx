@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useEffect, useState } from 'react';
+﻿import { FormEvent, ReactNode, useEffect, useState } from 'react';
 import {
   Activity, AlertTriangle, ArrowRight, BarChart3, Bell, Bot, Boxes, BrainCircuit,
   Check, ChevronDown, ChevronRight, ClipboardList, CloudUpload, Code2,
@@ -9,7 +9,9 @@ import {
   UserRound, UsersRound, WandSparkles, X
 } from 'lucide-react';
 import { api, ApiError } from './lib/api';
+import LiveSystemHealth from './components/LiveSystemHealth';
 import type { ApiEnvelope, LocalUser, Source, UserRole } from './lib/types';
+import { extractClarification, extractCountSummary, extractEvidenceRows, isConfirmedWrite, targetTable } from './lib/responseEvidence';
 import SessionCenterPage from './pages/SessionCenter';
 import CrudQueuePage from './pages/CrudQueue';
 import PipelineConsolePage from './pages/PipelineConsole';
@@ -46,7 +48,7 @@ export function asRecord(value: unknown): Record<string, any> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
 }
 
-export function stringValue(value: unknown, fallback = '—') {
+export function stringValue(value: unknown, fallback = 'â€”') {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
@@ -56,88 +58,29 @@ export function prettyKey(key: string) {
   return key.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export function normalizeEvidenceRows(value: unknown): Record<string, any>[] {
-  if (!Array.isArray(value)) return [];
-
-  return value.map((item, index) => {
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      return item as Record<string, any>;
-    }
-
-    if (typeof item === 'string') {
-      const raw = item.trim();
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            return parsed as Record<string, any>;
-          }
-        } catch {
-          // Older backend previews may contain Python-style stringified dictionaries.
-          const jsonLike = raw
-            .replace(/\bNone\b/g, 'null')
-            .replace(/\bTrue\b/g, 'true')
-            .replace(/\bFalse\b/g, 'false')
-            .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, key: string) => `${JSON.stringify(key)}:`)
-            .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, field: string) => `:${JSON.stringify(field)}`);
-          try {
-            const parsed = JSON.parse(jsonLike);
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              return parsed as Record<string, any>;
-            }
-          } catch {
-            // Fall through to a one-column safe display instead of rendering string characters.
-          }
-        }
-      }
-      return { record: item };
-    }
-
-    return { record_index: index + 1, value: item };
-  });
-}
-
-export function countContractFromData(data: Record<string, any>): Record<string, any> | null {
-  const raw = asRecord(data.count_contract || data.preview?.count_contract || data.pending_action?.preview_data?.count_contract);
-  const requested = data.requested_record_count ?? raw.requested_record_count ?? data.synthetic_generation?.requested_record_count;
-  const generated = data.generated_record_count ?? raw.generated_record_count ?? data.synthetic_generation?.generated_record_count;
-  const previewed = data.preview_record_count ?? raw.preview_record_count ?? data.preview?.record_count;
-  const stored = raw.stored_record_count;
-  const confirmed = data.confirmed_record_count ?? raw.confirmed_record_count ?? data.affected_row_count;
-  const returned = raw.returned_record_count ?? (Array.isArray(data.affected_records) ? data.affected_records.length : undefined);
-  const values = { requested_record_count: requested, generated_record_count: generated, preview_record_count: previewed, stored_record_count: stored, confirmed_record_count: confirmed, returned_record_count: returned };
-  const visible = Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== null));
-  if (!Object.keys(visible).length) return null;
-  return { ...visible, count_verified: data.count_verified ?? raw.count_verified ?? false };
-}
-
-export function evidenceRowsFromData(data: Record<string, any>): Record<string, any>[] {
-  const candidates = [
-    data.rows,
-    data.records,
-    data.results,
-    data.preview?.records,
-    data.pending_action?.preview_data?.records,
-    data.pending_action?.validated_payload?.records,
-  ];
-  for (const candidate of candidates) {
-    const rows = normalizeEvidenceRows(candidate);
-    if (rows.length) return rows;
-  }
-  return [];
-}
-
 export function formatTime(value: unknown) {
   if (!value) return 'Just now';
   const date = new Date(String(value));
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
+export function booleanValue(value: unknown): boolean | null {
+  if (value === true || value === false) return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', 'yes', '1', 'connected', 'ready', 'available'].includes(normalized)) return true;
+    if (['false', 'no', '0', 'not connected', 'disconnected', 'offline', 'unavailable'].includes(normalized)) return false;
+  }
+  return null;
+}
+
 export function statusTone(status?: string) {
   const value = (status || '').toLowerCase();
-  if (['success', 'ready', 'connected', 'completed', 'executed', 'active'].some((token) => value.includes(token))) return 'success';
+  // Negative phrases must be checked before positive tokens because
+  // "not connected" also contains the word "connected".
+  if (['not connected', 'disconnected', 'offline', 'failed', 'error', 'unavailable', 'validation'].some((token) => value.includes(token))) return 'danger';
   if (['pending', 'attention', 'warning', 'partial'].some((token) => value.includes(token))) return 'warning';
-  if (['failed', 'error', 'unavailable', 'validation'].some((token) => value.includes(token))) return 'danger';
+  if (['success', 'ready', 'connected', 'completed', 'executed', 'active'].some((token) => value.includes(token))) return 'success';
   return 'neutral';
 }
 
@@ -155,7 +98,7 @@ import { PageTransition } from './animation/motion';
 import { TransitionScreen } from './TransitionScreen';
 import { BusinessBackground } from './animation/BusinessBackground';
 function TransitionGate({ username, onDone }: { username: string; onDone: () => void }) {
-  // Keep TransitionScreen as the single ~1.5–2.5s authentication experience.
+  // Keep TransitionScreen as the single ~1.5â€“2.5s authentication experience.
   // After completion, transition directly into the main workspace.
   return (
     <TransitionScreen
@@ -297,7 +240,7 @@ function LoginView({ onEnter }: { onEnter: (user: LocalUser) => void }) {
             <span className="mask-line"><span>Act with proof.</span></span>
           </h1>
           <p className="login-copy fade-rise delay-5">
-            Search business records, understand company documents, and take safe source-backed action — entirely within your local environment.
+            Search business records, understand company documents, and take safe source-backed action â€” entirely within your local environment.
           </p>
           <div className="trust-stack fade-rise delay-6">
             <Trust text="Local-first processing" icon={<Database size={14} />} />
@@ -334,10 +277,10 @@ function LoginView({ onEnter }: { onEnter: (user: LocalUser) => void }) {
           </div>
           {error && <div className="form-error"><AlertTriangle size={14} /> {error}</div>}
           <button className="launch-button" type="submit" disabled={!bootReady || launching}>
-            {launching ? <><LoaderCircle className="spin" size={17} /> Preparing workspace…</> : <>Enter Workspace <ArrowRight size={17} /></>}
+            {launching ? <><LoaderCircle className="spin" size={17} /> Preparing workspaceâ€¦</> : <>Enter Workspace <ArrowRight size={17} /></>}
           </button>
           <div className="local-status"><b className={bootReady ? 'online-dot' : 'waiting-dot'} /> {bootReady ? 'LOCAL SERVICES READY' : 'INITIALIZING LOCAL SERVICES'}</div>
-          <small>Local-first · Privacy-aware · Grounded by evidence</small>
+          <small>Local-first Â· Privacy-aware Â· Grounded by evidence</small>
         </form>
       </div>
       <div className="login-footer">B2B INTELLIGENCE // LOCAL SYSTEM INTERFACE // v1.0</div>
@@ -346,7 +289,7 @@ function LoginView({ onEnter }: { onEnter: (user: LocalUser) => void }) {
 }
 
 function BootLine({ text, index, ready }: { text: string; index: number; ready: boolean }) {
-  return <div className={`boot-line ${ready && index === 3 ? 'ready' : ''}`} style={{ animationDelay: `${1.35 + index * 0.14}s` }}><span>›</span> {text}{index === 3 && !ready ? <b className="cursor">_</b> : null}</div>;
+  return <div className={`boot-line ${ready && index === 3 ? 'ready' : ''}`} style={{ animationDelay: `${1.35 + index * 0.14}s` }}><span>â€º</span> {text}{index === 3 && !ready ? <b className="cursor">_</b> : null}</div>;
 }
 
 function Trust({ icon, text }: { icon: ReactNode; text: string }) {
@@ -392,7 +335,7 @@ function Topbar({ user, page, sidebarOpen, onMenu, onPage }: { user: LocalUser; 
     <div className="top-actions">
       <button className="header-icon" onClick={() => onPage('assistant')} aria-label="Open assistant"><Search size={18} /></button>
       <button className="header-icon notification" aria-label="Notifications"><Bell size={18} /><i /></button>
-      <div className="ready-pill"><span className="online-dot" /> Local services ready</div>
+      <div className="ready-pill"><span className="online-dot" /> Local workspace</div>
       <div className="role-pill"><ShieldCheck size={14} /> {user.role === 'admin' ? 'Admin' : 'Normal user'}</div>
       {!sidebarOpen && <button className="header-icon" onClick={onMenu}><PanelRight size={18} /></button>}
     </div>
@@ -433,6 +376,7 @@ function Dashboard({ user, onPage, toast }: { user: LocalUser; onPage: (page: Pa
       ['demo', '/api/demo/status'],
       ['features', '/api/demo/features'],
       ['db', '/api/database/summary'],
+      ['ollama', '/api/llm/status'],
       ['rag', '/api/rag/status'],
       ['agent', '/api/agent/status'],
       ['mcp', '/api/mcp/status'],
@@ -465,13 +409,26 @@ function Dashboard({ user, onPage, toast }: { user: LocalUser; onPage: (page: Pa
         if (name === 'agent') flags.agent = 'connected';
         if (name === 'mcp') flags.mcp = 'connected';
         const responseData = asRecord(result.value[1].data);
+        const responsePayload = asRecord(responseData.data);
         const responseStatus = asRecord(responseData.status);
-        if (name === 'demo' && (responseStatus.ollama_connected === true || responseStatus.ollama_connected === 'true')) {
-          flags.ollama = 'connected';
+
+        // Prefer the dedicated Ollama health endpoint. The backend response is
+        // an envelope, so the real connection flag lives under data.connected.
+        if (name === 'ollama') {
+          const connected = booleanValue(responsePayload.connected ?? responseData.connected);
+          flags.ollama = connected === true ? 'connected' : 'not connected';
         }
-        // Ollama availability may also be exposed by the database summary.
-        if (name === 'db' && typeof responseStatus.ollama_connected === 'boolean') {
-          flags.ollama = responseStatus.ollama_connected ? 'connected' : 'not connected';
+
+        // Keep older aggregate endpoints as a fallback for compatibility.
+        if (name === 'demo' || name === 'db') {
+          const aggregateOllamaStatus = booleanValue(
+            responsePayload.ollama_connected
+              ?? responseStatus.ollama_connected
+              ?? responseData.ollama_connected,
+          );
+          if (aggregateOllamaStatus !== null && flags.ollama !== 'connected') {
+            flags.ollama = aggregateOllamaStatus ? 'connected' : 'not connected';
+          }
         }
       } else {
         nextErrors.push(result.reason?.message || 'A dashboard service could not be reached.');
@@ -505,19 +462,18 @@ function Dashboard({ user, onPage, toast }: { user: LocalUser; onPage: (page: Pa
     <div className="hero-panel glow-panel">
       <div className="hero-grid" />
       <div className="hero-content"><div className="eyebrow compact"><i /> LOCAL-FIRST BUSINESS INTELLIGENCE</div><h2>Your business intelligence<br/><em>workspace is ready.</em></h2><p>Ask grounded questions across business records and uploaded documents without leaving your local environment.</p><div className="hero-actions"><button className="button primary" onClick={() => onPage('assistant')}><Bot size={17} /> Ask the Assistant</button><button className="button secondary" onClick={() => onPage('explorer')}><Table2 size={17} /> Browse Data</button><button className="button ghost" onClick={() => onPage('documents')}><CloudUpload size={17} /> Upload Document</button></div></div>
-      <div className="architecture-card"><div className="architecture-label">LOCAL ANSWER PATH</div><div className="arch-flow"><span><UserRound size={14} /> User</span><i /><span><Network size={14} /> Router</span><i /><span><Boxes size={14} /> MCP</span><i /><span><Database size={14} /> Data / RAG</span></div><div className="arch-answer"><Sparkles size={16} /> Grounded answer · evidence attached</div></div>
+      <div className="architecture-card"><div className="architecture-label">LOCAL ANSWER PATH</div><div className="arch-flow"><span><UserRound size={14} /> User</span><i /><span><Network size={14} /> Router</span><i /><span><Boxes size={14} /> MCP</span><i /><span><Database size={14} /> Data / RAG</span></div><div className="arch-answer"><Sparkles size={16} /> Grounded answer Â· evidence attached</div></div>
     </div>
 
     {errors.length > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>{errors[0]}</span><button onClick={() => void load()}><RefreshCw size={15} /> Retry</button></div>}
-    <section><SectionHeading title="Local system health" action={<button className="text-button" onClick={() => void load()}><RefreshCw size={15} /> Refresh</button>} />
-      <div className="service-grid">{services.map(([name, detail, state, Icon]) => <ServiceCard key={String(name)} title={String(name)} detail={String(detail)} state={typeof state === 'boolean' ? (state ? 'Ready' : 'Attention') : String(state)} icon={<Icon size={19} />} loading={loading} />)}</div>
-    </section>
+
+    <LiveSystemHealth role={user.role} />
 
     <section className="dashboard-split"><div className="surface-card capability-card"><SectionHeading title="Core capability coverage" eyebrow="PHASE 16 READINESS" /><div className="capability-grid">{loading && Array.from({ length: 8 }).map((_, i) => <div className="skeleton-tile" key={i} />)}{!loading && (features.length ? features : ['Natural-language search','CRUD confirmation','Document OCR','Document RAG','Hybrid evidence','Audit logs','Rollback','Benchmarks']).slice(0, 12).map((feature: any, index: number) => <CapabilityTile key={feature.feature || feature.name || index} title={feature.feature || feature.name || String(feature)} status={feature.status || feature.availability || (index % 4 === 0 ? 'Admin' : 'Ready')} />)}</div></div>
       <div className="surface-card data-pulse"><SectionHeading title="Live workspace pulse" eyebrow="BACKEND-DRIVEN" /><div className="count-stack">{Object.entries(counts).filter(([key]) => !['status','message'].includes(key)).slice(0, 5).map(([key, value]) => <div className="count-row" key={key}><span><Database size={15} /> {prettyKey(key)}</span><b>{stringValue(value, '0')}</b></div>)}{Object.keys(counts).length === 0 && <Empty icon={<Database size={22} />} title="Waiting for database summary" text="Start the backend, then refresh this workspace." />}</div></div>
     </section>
 
-    <section className="dashboard-split"><div className="surface-card activity-card"><SectionHeading title="Recent intelligence activity" eyebrow="TRACEABLE WORKFLOWS" /><div className="activity-list">{docs.length ? docs.slice(0, 5).map((doc: any, i: number) => <div className="activity-row" key={doc.document_id || doc.id || i}><span className="activity-icon"><FileText size={16} /></span><div><b>{doc.original_filename || doc.filename || 'Uploaded document'}</b><small>{doc.ingestion_status || doc.status || 'Document activity'} · {formatTime(doc.uploaded_at || doc.created_at)}</small></div><StatusBadge status={doc.rag_indexed ? 'Indexed' : doc.ingestion_status || 'Ready'} /></div>) : <Empty icon={<History size={22} />} title="No recent document activity" text="Upload a brochure or policy to begin building local knowledge." />}</div></div>
+    <section className="dashboard-split"><div className="surface-card activity-card"><SectionHeading title="Recent intelligence activity" eyebrow="TRACEABLE WORKFLOWS" /><div className="activity-list">{docs.length ? docs.slice(0, 5).map((doc: any, i: number) => <div className="activity-row" key={doc.document_id || doc.id || i}><span className="activity-icon"><FileText size={16} /></span><div><b>{doc.original_filename || doc.filename || 'Uploaded document'}</b><small>{doc.ingestion_status || doc.status || 'Document activity'} Â· {formatTime(doc.uploaded_at || doc.created_at)}</small></div><StatusBadge status={doc.rag_indexed ? 'Indexed' : doc.ingestion_status || 'Ready'} /></div>) : <Empty icon={<History size={22} />} title="No recent document activity" text="Upload a brochure or policy to begin building local knowledge." />}</div></div>
       <div className="surface-card action-card"><SectionHeading title="Quick actions" eyebrow="START HERE" /><div className="quick-grid"><QuickAction icon={<MessageSquareText size={20} />} title="Ask assistant" text="Use query, RAG, actions, sessions, and evidence together." onClick={() => onPage('assistant')} /><QuickAction icon={<Table2 size={20} />} title="Explore data" text="Browse records, schema, and relationships." onClick={() => onPage('explorer')} /><QuickAction icon={<Upload size={20} />} title="Process documents" text="Upload, index, and inspect chunks." onClick={() => onPage('documents')} />{user.role === 'admin' && <QuickAction icon={<Sparkles size={20} />} title="Demo readiness" text="Open the hidden reviewer route." onClick={() => onPage('demo')} />}</div></div>
     </section>
 
@@ -591,9 +547,9 @@ function Assistant({ user, toast }: { user: LocalUser; toast: (message: string, 
         <section className="chat-panel surface-card">
           <div className="chat-scroll">{messages.length === 0 && <div className="assistant-empty"><span className="assistant-avatar"><Sparkles size={22} /></span><h3>What would you like to understand?</h3><p>Ask about current business records, uploaded documents, or a verified combination of both.</p><div className="prompt-chips">{['Show workers from Bangalore','What warranty is mentioned for TextileBot X?','Which vendor offers textile automation products under 5 lakh according to the brochure?','Add a new employee safely'].map((item) => <button key={item} onClick={() => void submit(undefined, item)}>{item}</button>)}</div></div>}
             {messages.map((message) => <ChatMessage key={message.id} message={message} onInspect={() => message.response && setSelectedResponse(message.response)} onConfirm={() => message.response && setConfirming(message.response)} onCancel={() => message.response && void mutatePending(message.response, 'cancel')} />)}
-            {loading && <div className="assistant-message loading-message"><span className="assistant-avatar"><Bot size={17} /></span><div><div className="typing"><i/><i/><i/></div><small>Preparing grounded response through local services…</small></div></div>}
+            {loading && <div className="assistant-message loading-message"><span className="assistant-avatar"><Bot size={17} /></span><div><div className="typing"><i/><i/><i/></div><small>Preparing grounded response through local servicesâ€¦</small></div></div>}
           </div>
-          <form className="composer" onSubmit={(event) => void submit(event)}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about your business data or documents…" rows={1} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); } }} /><button className="send-button" disabled={!question.trim() || loading} aria-label="Send message"><Send size={18} /></button><span>Enter to send · Shift + Enter for a new line</span></form>
+          <form className="composer" onSubmit={(event) => void submit(event)}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about your business data or documentsâ€¦" rows={1} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); } }} /><button className="send-button" disabled={!question.trim() || loading} aria-label="Send message"><Send size={18} /></button><span>Enter to send Â· Shift + Enter for a new line</span></form>
         </section>
         <EvidencePanel response={selectedResponse} />
       </div>
@@ -607,31 +563,58 @@ function Assistant({ user, toast }: { user: LocalUser; toast: (message: string, 
   </div>;
 }
 
+function CountSummaryStrip({ response }: { response?: ApiEnvelope<any> | null }) {
+  const counts = extractCountSummary(response);
+  const entries = [
+    ['Requested', counts.requested],
+    ['Generated', counts.generated],
+    ['Previewed', counts.previewed],
+    ['Stored', counts.stored],
+    ['Confirmed', counts.confirmed ?? counts.affected],
+    ['Displayed', counts.displayed],
+  ].filter(([, value]) => typeof value === 'number') as [string, number][];
+  if (!entries.length) return null;
+  return <div className="count-summary-strip">{entries.map(([label, value]) => <span key={label}><small>{label}</small><b>{value}</b></span>)}{counts.verified !== undefined && <StatusBadge status={counts.verified ? 'Count verified' : 'Count mismatch'} />}</div>;
+}
+
 function ChatMessage({ message, onInspect, onConfirm, onCancel }: { message: { id: string; from: 'user' | 'assistant'; text: string; response?: ApiEnvelope<any> }; onInspect: () => void; onConfirm: () => void; onCancel: () => void }) {
   const response = message.response;
   if (message.from === 'user') return <div className="message-row user-row"><div className="user-bubble">{message.text}</div><span className="user-mini-avatar">U</span></div>;
   const data = asRecord(response?.data);
   const status = response?.status;
   const route = response?.route;
-  const contextualRows = normalizeEvidenceRows(data.rows);
-  const isResolvedReference = Boolean(data.conversation_resolution);
-  const countContract = countContractFromData(data);
-  const pendingCount = data.requested_record_count ?? data.generated_record_count ?? data.preview?.record_count ?? data.pending_action?.preview_data?.record_count;
-  return <div className="message-row assistant-row"><span className="assistant-avatar"><Sparkles size={16} /></span><div className="assistant-message"><div className="message-meta"><RouteBadge route={route} /><StatusBadge status={status || 'Response'} /></div><p>{message.text}</p>{isResolvedReference && contextualRows.length > 0 && <div className="resolved-records"><small>{contextualRows.length} referenced record{contextualRows.length === 1 ? '' : 's'}</small><DataPreview rows={contextualRows.slice(0, 50)} /></div>}{response?.sources?.length ? <div className="source-chip-row">{response.sources.slice(0, 4).map((source, index) => <button key={`${source.reference}-${index}`} className="source-chip" onClick={onInspect}><FileSearch size={12} /> {source.reference || source.source_type || 'Source'}</button>)}</div> : null}{response?.generated_sql && <button className="query-drawer" onClick={onInspect}><Code2 size={14} /> View validated query <ChevronRight size={14} /></button>}{status === 'pending_confirmation' && <div className="pending-card"><div><span className="pending-icon"><AlertTriangle size={18} /></span><div><b>Action requires confirmation</b><small>This action will change stored business data after confirmation.</small></div></div><div className="pending-details"><span>Target: <strong>{data.pending_action?.target_table || data.preview?.target_table || 'controlled record'}</strong></span><span>Action: <strong>{data.pending_action?.action_type || 'write'}</strong></span>{pendingCount ? <span>Records: <strong>{String(pendingCount)}</strong></span> : null}{countContract?.count_verified ? <span>Count: <strong>verified</strong></span> : null}</div><div className="pending-actions"><button className="button secondary" onClick={onCancel}>Cancel preview</button><button className="button warning" onClick={onConfirm}>Confirm action <ArrowRight size={15} /></button></div></div>}</div></div>;
+  const rows = extractEvidenceRows(response);
+  const counts = extractCountSummary(response);
+  const clarification = extractClarification(response);
+  const confirmedWrite = isConfirmedWrite(response);
+  const pending = status === 'pending_confirmation';
+  const visibleCount = counts.affected ?? counts.previewed ?? counts.generated ?? rows.length;
+  const table = targetTable(response) || 'controlled record';
+  return <div className="message-row assistant-row"><span className="assistant-avatar"><Sparkles size={16} /></span><div className="assistant-message"><div className="message-meta"><RouteBadge route={route} /><StatusBadge status={status || 'Response'} /></div><p>{message.text}</p>{clarification.required && <div className="clarification-card"><div><AlertTriangle size={17} /><div><b>Clarification needed</b><small>I stopped before SQL generation or a database write.</small></div></div>{clarification.missingFields.length > 0 && <div className="clarification-fields"><span>Missing:</span>{clarification.missingFields.map((field) => <code key={field}>{prettyKey(field)}</code>)}</div>}{clarification.options.length > 0 && <div className="clarification-options"><span>Available choices:</span>{clarification.options.map((option) => <code key={option}>{option}</code>)}</div>}</div>}{response?.sources?.length ? <div className="source-chip-row">{response.sources.slice(0, 4).map((source, index) => <button key={`${source.reference}-${index}`} className="source-chip" onClick={onInspect}><FileSearch size={12} /> {source.reference || source.source_type || 'Source'}</button>)}</div> : null}{response?.generated_sql && <button className="query-drawer" onClick={onInspect}><Code2 size={14} /> View validated query <ChevronRight size={14} /></button>}{(pending || confirmedWrite) && <CountSummaryStrip response={response} />}{rows.length > 0 && pending && <button className="record-action-button" onClick={onInspect}><Table2 size={15} /> View complete preview <span>{rows.length}</span></button>}{rows.length > 0 && confirmedWrite && <button className="record-action-button success" onClick={onInspect}><Table2 size={15} /> View created records <span>{rows.length}</span></button>}{pending && <div className="pending-card"><div><span className="pending-icon"><AlertTriangle size={18} /></span><div><b>Action requires confirmation</b><small>This action will change stored business data after confirmation.</small></div></div><div className="pending-details"><span>Target: <strong>{table}</strong></span><span>Action: <strong>{data.pending_action?.action_type || 'write'}</strong></span><span>Records: <strong>{visibleCount}</strong></span></div><div className="pending-actions"><button className="button secondary" onClick={onCancel}>Cancel preview</button><button className="button warning" onClick={onConfirm}>Confirm action <ArrowRight size={15} /></button></div></div>}</div></div>;
 }
 
 function EvidencePanel({ response }: { response: ApiEnvelope<any> | null }) {
+  const [page, setPage] = useState(0);
+  const pageSize = 10;
+  useEffect(() => setPage(0), [response?.request_id, response?.pending_action_id, response?.status]);
   if (!response) return <aside className="evidence-panel surface-card empty-evidence"><PanelRight size={24} /><h3>Evidence & traceability</h3><p>Ask a question to inspect source references, database evidence, retrieved chunks, and safe generated SQL.</p></aside>;
   const data = asRecord(response.data);
-  const rows = evidenceRowsFromData(data);
-  const countContract = countContractFromData(data);
+  const rows = extractEvidenceRows(response);
   const chunks = Array.isArray(data.retrieved_chunks) ? data.retrieved_chunks : Array.isArray(data.matches) ? data.matches : [];
-  return <aside className="evidence-panel surface-card"><SectionHeading title="Evidence & traceability" eyebrow="READ-ONLY DETAIL" /><div className="evidence-section"><span>Route</span><RouteBadge route={response.route} /></div><div className="evidence-section"><span>Status</span><StatusBadge status={response.status} /></div>{response.sources?.length ? <div className="evidence-block"><h4>Answer sources</h4>{response.sources.map((source, index) => <div className="evidence-source" key={`${source.reference}-${index}`}><FileText size={15} /><div><b>{source.reference || source.source_type || 'Source'}</b><small>{source.detail || source.source_type || 'Grounded source'}</small></div></div>)}</div> : null}{response.generated_sql && <div className="evidence-block"><h4>Validated query</h4><pre>{response.generated_sql}</pre></div>}{countContract ? <div className="evidence-block"><h4>Bulk count verification</h4><div className="count-stack">{Object.entries(countContract).filter(([key]) => key !== 'count_verified').map(([key, value]) => <div className="count-row" key={key}><span>{prettyKey(key)}</span><b>{stringValue(value)}</b></div>)}<div className="count-row"><span>Count verified</span><b>{countContract.count_verified ? 'Yes' : 'Pending'}</b></div></div></div> : null}{rows.length ? <div className="evidence-block"><h4>Database evidence · {rows.length} record{rows.length === 1 ? '' : 's'}</h4><DataPreview rows={rows.slice(0, 50)} /></div> : null}{chunks.length ? <div className="evidence-block"><h4>Retrieved chunks</h4>{chunks.slice(0, 3).map((chunk: any, index: number) => <div className="chunk" key={chunk.reference || index}><b>{chunk.reference || chunk.filename || `Chunk ${index + 1}`}</b><p>{chunk.text_preview || chunk.text || chunk.content || 'Document evidence retrieved.'}</p></div>)}</div> : null}</aside>;
+  const counts = extractCountSummary(response);
+  const clarification = extractClarification(response);
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const pending = response.status === 'pending_confirmation';
+  const confirmed = isConfirmedWrite(response);
+  const recordTitle = pending ? `Generated preview Â· ${rows.length} records` : confirmed ? `Created database records Â· ${rows.length}` : `Database evidence Â· ${rows.length} records`;
+  return <aside className="evidence-panel surface-card"><SectionHeading title="Evidence & traceability" eyebrow="READ-ONLY DETAIL" /><div className="evidence-section"><span>Route</span><RouteBadge route={response.route} /></div><div className="evidence-section"><span>Status</span><StatusBadge status={response.status} /></div>{clarification.required && <div className="evidence-block clarification-evidence"><h4>Clarification required</h4><p>{response.answer}</p>{clarification.missingFields.length > 0 && <div className="clarification-fields">{clarification.missingFields.map((field) => <code key={field}>{prettyKey(field)}</code>)}</div>}</div>}{response.sources?.length ? <div className="evidence-block"><h4>Answer sources</h4>{response.sources.map((source, index) => <div className="evidence-source" key={`${source.reference}-${index}`}><FileText size={15} /><div><b>{source.reference || source.source_type || 'Source'}</b><small>{source.detail || source.source_type || 'Grounded source'}</small></div></div>)}</div> : null}{response.generated_sql && <div className="evidence-block"><h4>Validated query</h4><pre>{response.generated_sql}</pre></div>}{(counts.requested !== undefined || counts.generated !== undefined || counts.affected !== undefined) && <div className="evidence-block"><h4>Record count verification</h4><CountSummaryStrip response={response} /></div>}{rows.length ? <div className="evidence-block"><div className="evidence-record-heading"><h4>{recordTitle}</h4>{pageCount > 1 && <span>Page {safePage + 1} of {pageCount}</span>}</div><DataPreview rows={visibleRows} />{pageCount > 1 && <div className="evidence-pagination"><button className="button small secondary" disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Previous</button><span>Showing {safePage * pageSize + 1}â€“{Math.min(rows.length, (safePage + 1) * pageSize)} of {rows.length}</span><button className="button small secondary" disabled={safePage >= pageCount - 1} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}>Next</button></div>}</div> : null}{chunks.length ? <div className="evidence-block"><h4>Retrieved chunks</h4>{chunks.slice(0, 3).map((chunk: any, index: number) => <div className="chunk" key={chunk.reference || index}><b>{chunk.reference || chunk.filename || `Chunk ${index + 1}`}</b><p>{chunk.text_preview || chunk.text || chunk.content || 'Document evidence retrieved.'}</p></div>)}</div> : null}</aside>;
 }
 
 function ConfirmModal({ response, onClose, onConfirm }: { response: ApiEnvelope<any>; onClose: () => void; onConfirm: () => void }) {
   const data = asRecord(response.data); const action = data.pending_action || data.preview || {};
-  return <div className="modal-backdrop"><div className="confirm-modal"><span className="confirm-icon"><AlertTriangle size={24} /></span><div className="eyebrow compact"><i /> EXPLICIT CONFIRMATION REQUIRED</div><h3>Confirm database change?</h3><p>You are about to execute one stored, validator-approved action. The action and its outcome will be recorded in audit history.</p><div className="confirm-summary"><span>Action <b>{action.action_type || 'write'}</b></span><span>Target <b>{action.target_table || data.preview?.target_table || 'business data'}</b></span>{(data.requested_record_count ?? data.preview?.record_count) ? <span>Records <b>{String(data.requested_record_count ?? data.preview?.record_count)}</b></span> : null}<span>Pending ID <b>{response.pending_action_id || '—'}</b></span></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Go back</button><button className="button warning" onClick={onConfirm}>Confirm and execute <ShieldCheck size={16} /></button></div></div></div>;
+  return <div className="modal-backdrop"><div className="confirm-modal"><span className="confirm-icon"><AlertTriangle size={24} /></span><div className="eyebrow compact"><i /> EXPLICIT CONFIRMATION REQUIRED</div><h3>Confirm database change?</h3><p>You are about to execute one stored, validator-approved action. The action and its outcome will be recorded in audit history.</p><div className="confirm-summary"><span>Action <b>{action.action_type || 'write'}</b></span><span>Target <b>{action.target_table || 'business data'}</b></span><span>Pending ID <b>{response.pending_action_id || 'â€”'}</b></span></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Go back</button><button className="button warning" onClick={onConfirm}>Confirm and execute <ShieldCheck size={16} /></button></div></div></div>;
 }
 
 function Explorer({ user, toast }: { user: LocalUser; toast: (message: string, type?: Toast['type']) => void }) {
@@ -678,7 +661,7 @@ function DocumentsPage({ user, toast }: { user: LocalUser; toast: (message: stri
   const upload = async (files: FileList | null) => { const file = files?.item(0); if (!file) return; setUploading(true); const form = new FormData(); form.append('file', file); try { const response = await api.post('/api/documents/upload', user.role, form); toast(response.answer || 'Document uploaded.', 'success'); await load(); } catch (e) { toast(e instanceof Error ? e.message : 'Document upload failed.', 'error'); } finally { setUploading(false); } };
   const openDocument = async (doc: any) => { setSelected(doc); try { const response = await api.get(`/api/documents/${doc.document_id || doc.id}`, user.role); setDetails(response); } catch (e) { toast(e instanceof Error ? e.message : 'Could not load document details.', 'error'); } };
   const indexDocument = async (id: string) => { try { const response = await api.post(`/api/rag/documents/${id}/index`, user.role, { force_reindex: false }); toast(response.answer || 'Document indexed locally.', 'success'); await load(); } catch (e) { toast(e instanceof Error ? e.message : 'Document indexing failed.', 'error'); } };
-  return <div className="documents-page page-enter"><section className="upload-hero surface-card"><div className="upload-copy"><div className="eyebrow compact"><i /> LOCAL DOCUMENT PIPELINE</div><h2>Turn company files into <em>searchable evidence.</em></h2><p>Upload PDF, DOCX, TXT, JPG, JPEG, or PNG documents. Native text and local OCR are processed before optional vector indexing.</p><div className="file-types"><span>PDF</span><span>DOCX</span><span>TXT</span><span>JPG</span><span>PNG</span></div></div><label className={`dropzone ${uploading ? 'processing' : ''}`}><input type="file" accept=".pdf,.docx,.txt,.jpg,.jpeg,.png" onChange={(event) => void upload(event.target.files)} /><div className="scanner"><FileCode2 size={32} /><i /></div><b>{uploading ? 'Processing local document…' : 'Drop a document here'}</b><small>{uploading ? 'Validating · extracting · OCR when required' : 'or click to choose a file'}</small><button type="button" className="button secondary"><Upload size={16} /> Choose file</button></label></section><section className="surface-card document-list"><div className="table-top"><div><div className="eyebrow compact"><i /> DOCUMENT WORKSPACE</div><h2>Uploaded documents</h2></div><button className="text-button" onClick={() => void load()}><RefreshCw size={15} /> Refresh</button></div>{loading ? <TableSkeleton /> : docs.length ? <div className="document-grid">{docs.map((doc, index) => <article className="document-card" key={doc.document_id || doc.id || index}><div className="doc-top"><FileTypeIcon type={doc.file_type || doc.content_type} /><StatusBadge status={doc.rag_indexed ? 'Indexed' : doc.ingestion_status || 'Ready'} /></div><h3>{doc.original_filename || doc.filename || 'Untitled document'}</h3><p>{doc.file_type || 'document'} · {doc.ocr_used ? 'OCR used' : 'Native text'} · {formatTime(doc.uploaded_at || doc.created_at)}</p><div className="doc-actions"><button className="button small secondary" onClick={() => void openDocument(doc)}>Details</button><button className="button small primary" onClick={() => void indexDocument(doc.document_id || doc.id)} disabled={doc.rag_indexed}> {doc.rag_indexed ? 'Indexed' : 'Index for RAG'} </button></div></article>)}</div> : <Empty icon={<FolderOpen size={24} />} title="No uploaded documents" text="Use the local upload zone to begin extracting and indexing company knowledge." />}</section>{selected && <DocumentDrawer document={selected} details={details} user={user} onClose={() => { setSelected(null); setDetails(null); }} toast={toast} />}</div>;
+  return <div className="documents-page page-enter"><section className="upload-hero surface-card"><div className="upload-copy"><div className="eyebrow compact"><i /> LOCAL DOCUMENT PIPELINE</div><h2>Turn company files into <em>searchable evidence.</em></h2><p>Upload PDF, DOCX, TXT, JPG, JPEG, or PNG documents. Native text and local OCR are processed before optional vector indexing.</p><div className="file-types"><span>PDF</span><span>DOCX</span><span>TXT</span><span>JPG</span><span>PNG</span></div></div><label className={`dropzone ${uploading ? 'processing' : ''}`}><input type="file" accept=".pdf,.docx,.txt,.jpg,.jpeg,.png" onChange={(event) => void upload(event.target.files)} /><div className="scanner"><FileCode2 size={32} /><i /></div><b>{uploading ? 'Processing local documentâ€¦' : 'Drop a document here'}</b><small>{uploading ? 'Validating Â· extracting Â· OCR when required' : 'or click to choose a file'}</small><button type="button" className="button secondary"><Upload size={16} /> Choose file</button></label></section><section className="surface-card document-list"><div className="table-top"><div><div className="eyebrow compact"><i /> DOCUMENT WORKSPACE</div><h2>Uploaded documents</h2></div><button className="text-button" onClick={() => void load()}><RefreshCw size={15} /> Refresh</button></div>{loading ? <TableSkeleton /> : docs.length ? <div className="document-grid">{docs.map((doc, index) => <article className="document-card" key={doc.document_id || doc.id || index}><div className="doc-top"><FileTypeIcon type={doc.file_type || doc.content_type} /><StatusBadge status={doc.rag_indexed ? 'Indexed' : doc.ingestion_status || 'Ready'} /></div><h3>{doc.original_filename || doc.filename || 'Untitled document'}</h3><p>{doc.file_type || 'document'} Â· {doc.ocr_used ? 'OCR used' : 'Native text'} Â· {formatTime(doc.uploaded_at || doc.created_at)}</p><div className="doc-actions"><button className="button small secondary" onClick={() => void openDocument(doc)}>Details</button><button className="button small primary" onClick={() => void indexDocument(doc.document_id || doc.id)} disabled={doc.rag_indexed}> {doc.rag_indexed ? 'Indexed' : 'Index for RAG'} </button></div></article>)}</div> : <Empty icon={<FolderOpen size={24} />} title="No uploaded documents" text="Use the local upload zone to begin extracting and indexing company knowledge." />}</section>{selected && <DocumentDrawer document={selected} details={details} user={user} onClose={() => { setSelected(null); setDetails(null); }} toast={toast} />}</div>;
 }
 
 function KnowledgeWorkspace({ user, toast }: { user: LocalUser; toast: (message: string, type?: Toast['type']) => void }) {
@@ -686,7 +669,7 @@ function KnowledgeWorkspace({ user, toast }: { user: LocalUser; toast: (message:
   useEffect(() => { void api.get('/api/rag/status', user.role).then((response) => setStatus(asRecord(response.data))).catch(() => undefined); }, [user.role]);
   const ask = async (event: FormEvent) => { event.preventDefault(); if (!question.trim() || loading) return; setLoading(true); try { const response = await api.post(mode === 'answer' ? '/api/rag/query' : '/api/rag/retrieve', user.role, { question, top_k: 4 }); setResult(response); } catch (e) { toast(e instanceof Error ? e.message : 'Knowledge base request failed.', 'error'); } finally { setLoading(false); } };
   const matches = result ? (result.data?.retrieved_chunks || result.data?.matches || []) as any[] : [];
-  return <div className="knowledge-page embedded-workspace"><section className="knowledge-hero glow-panel"><div className="hero-grid" /><div className="knowledge-inner"><div className="eyebrow compact"><i /> LOCAL CHROMADB KNOWLEDGE BASE</div><h2>Search what your documents <em>actually say.</em></h2><p>Retrieve semantic evidence without model generation, or ask for an answer grounded only in retrieved document chunks.</p><form className="knowledge-search" onSubmit={ask}><Search size={19} /><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about uploaded company documents…" /><button className="button primary" disabled={!question.trim() || loading}>{loading ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />} Search</button></form><div className="mode-row"><button className={`mode-button ${mode === 'retrieve' ? 'selected' : ''}`} onClick={() => setMode('retrieve')}><FileSearch size={15} /> Retrieval only</button><button className={`mode-button ${mode === 'answer' ? 'selected' : ''}`} onClick={() => setMode('answer')}><WandSparkles size={15} /> Grounded answer</button><span>Index: {stringValue(status.indexed_chunk_count ?? status.chunk_count, '—')} local chunks</span></div></div></section>{result && <section className="knowledge-results"><div className="surface-card answer-card"><div className="answer-head"><div><div className="eyebrow compact"><i /> {mode === 'answer' ? 'GROUNDING POLICY ACTIVE' : 'SEMANTIC RETRIEVAL ONLY'}</div><h3>{mode === 'answer' ? 'Grounded answer' : 'Retrieved evidence'}</h3></div><StatusBadge status={result.status} /></div><p className="answer-text">{result.answer}</p>{mode === 'answer' && <div className="grounding-note"><ShieldCheck size={16} /> Generated from retrieved document evidence only.</div>}</div><div className="match-list">{matches.length ? matches.map((match, index) => <article className="match-card surface-card" key={match.reference || index}><div><StatusBadge status={`Similarity ${typeof match.similarity === 'number' ? match.similarity.toFixed(3) : 'match'}`} /><b>{match.reference || match.filename || `Document chunk ${index + 1}`}</b></div><p>{match.text_preview || match.text || match.content || 'Retrieved local document evidence.'}</p></article>) : <Empty icon={<FileSearch size={22} />} title="No relevant evidence found" text="Try a broader question or upload a document containing this information." />}</div></section>}</div>;
+  return <div className="knowledge-page embedded-workspace"><section className="knowledge-hero glow-panel"><div className="hero-grid" /><div className="knowledge-inner"><div className="eyebrow compact"><i /> LOCAL CHROMADB KNOWLEDGE BASE</div><h2>Search what your documents <em>actually say.</em></h2><p>Retrieve semantic evidence without model generation, or ask for an answer grounded only in retrieved document chunks.</p><form className="knowledge-search" onSubmit={ask}><Search size={19} /><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about uploaded company documentsâ€¦" /><button className="button primary" disabled={!question.trim() || loading}>{loading ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />} Search</button></form><div className="mode-row"><button className={`mode-button ${mode === 'retrieve' ? 'selected' : ''}`} onClick={() => setMode('retrieve')}><FileSearch size={15} /> Retrieval only</button><button className={`mode-button ${mode === 'answer' ? 'selected' : ''}`} onClick={() => setMode('answer')}><WandSparkles size={15} /> Grounded answer</button><span>Index: {stringValue(status.indexed_chunk_count ?? status.chunk_count, 'â€”')} local chunks</span></div></div></section>{result && <section className="knowledge-results"><div className="surface-card answer-card"><div className="answer-head"><div><div className="eyebrow compact"><i /> {mode === 'answer' ? 'GROUNDING POLICY ACTIVE' : 'SEMANTIC RETRIEVAL ONLY'}</div><h3>{mode === 'answer' ? 'Grounded answer' : 'Retrieved evidence'}</h3></div><StatusBadge status={result.status} /></div><p className="answer-text">{result.answer}</p>{mode === 'answer' && <div className="grounding-note"><ShieldCheck size={16} /> Generated from retrieved document evidence only.</div>}</div><div className="match-list">{matches.length ? matches.map((match, index) => <article className="match-card surface-card" key={match.reference || index}><div><StatusBadge status={`Similarity ${typeof match.similarity === 'number' ? match.similarity.toFixed(3) : 'match'}`} /><b>{match.reference || match.filename || `Document chunk ${index + 1}`}</b></div><p>{match.text_preview || match.text || match.content || 'Retrieved local document evidence.'}</p></article>) : <Empty icon={<FileSearch size={22} />} title="No relevant evidence found" text="Try a broader question or upload a document containing this information." />}</div></section>}</div>;
 }
 
 function AuditPage({ user, toast }: { user: LocalUser; toast: (message: string, type?: Toast['type']) => void }) {
@@ -694,7 +677,7 @@ function AuditPage({ user, toast }: { user: LocalUser; toast: (message: string, 
   const load = async () => { setLoading(true); try { const [logResponse, actionResponse] = await Promise.all([api.get('/api/logs?category=all&limit=50', user.role), api.get('/api/audit/actions?limit=50', user.role)]); setLogs(asRecord(logResponse.data)); setActions((actionResponse.data?.actions || []) as any[]); } catch (e) { toast(e instanceof Error ? e.message : 'Could not load admin audit data.', 'error'); } finally { setLoading(false); } };
   useEffect(() => { void load(); }, [user.role]);
   const inspect = async (action: any) => { setSelected(action); try { const response = await api.get(`/api/audit/actions/${action.action_log_id || action.id}`, user.role); setDetail(response); } catch (e) { toast(e instanceof Error ? e.message : 'Could not load audit detail.', 'error'); } };
-  return <div className="audit-page page-enter"><section className="audit-hero surface-card"><div><div className="eyebrow compact"><i /> ADMIN-ONLY EVIDENCE</div><h2>Every sensitive action leaves a trace.</h2><p>Review prompts, confirmation status, snapshots, and eligible rollback evidence without exposing unrestricted database access.</p></div><div className="audit-shield"><ShieldCheck size={38} /><span>Audit hardening active</span></div></section><div className="tab-row"><button className={tab === 'actions' ? 'selected' : ''} onClick={() => setTab('actions')}>Action history</button><button className={tab === 'logs' ? 'selected' : ''} onClick={() => setTab('logs')}>Query history</button></div>{loading ? <TableSkeleton /> : tab === 'actions' ? <section className="surface-card"><SectionHeading title="Audited actions" eyebrow="CONFIRMATIONS · SNAPSHOTS · RECOVERY" /><RecordTable rows={actions} onRow={(row) => void inspect(row)} /></section> : <section className="surface-card"><SectionHeading title="Query history" eyebrow="ROUTED REQUESTS" /><RecordTable rows={(logs.query_logs || []) as any[]} onRow={(row) => setSelected(row)} /></section>}{selected && <AuditDrawer action={selected} detail={detail} user={user} onClose={() => { setSelected(null); setDetail(null); }} toast={toast} />}</div>;
+  return <div className="audit-page page-enter"><section className="audit-hero surface-card"><div><div className="eyebrow compact"><i /> ADMIN-ONLY EVIDENCE</div><h2>Every sensitive action leaves a trace.</h2><p>Review prompts, confirmation status, snapshots, and eligible rollback evidence without exposing unrestricted database access.</p></div><div className="audit-shield"><ShieldCheck size={38} /><span>Audit hardening active</span></div></section><div className="tab-row"><button className={tab === 'actions' ? 'selected' : ''} onClick={() => setTab('actions')}>Action history</button><button className={tab === 'logs' ? 'selected' : ''} onClick={() => setTab('logs')}>Query history</button></div>{loading ? <TableSkeleton /> : tab === 'actions' ? <section className="surface-card"><SectionHeading title="Audited actions" eyebrow="CONFIRMATIONS Â· SNAPSHOTS Â· RECOVERY" /><RecordTable rows={actions} onRow={(row) => void inspect(row)} /></section> : <section className="surface-card"><SectionHeading title="Query history" eyebrow="ROUTED REQUESTS" /><RecordTable rows={(logs.query_logs || []) as any[]} onRow={(row) => setSelected(row)} /></section>}{selected && <AuditDrawer action={selected} detail={detail} user={user} onClose={() => { setSelected(null); setDetail(null); }} toast={toast} />}</div>;
 }
 
 function DemoPage({ user, toast }: { user: LocalUser; toast: (message: string, type?: Toast['type']) => void }) {
@@ -703,7 +686,7 @@ function DemoPage({ user, toast }: { user: LocalUser; toast: (message: string, t
   useEffect(() => { void load(); }, [user.role]);
   const runSmoke = async () => { setRunning(true); try { const result = await api.get('/api/demo/smoke', user.role); setSmoke(result); toast(result.answer || 'Safe smoke check completed.', 'success'); } catch (e) { toast(e instanceof Error ? e.message : 'Smoke check failed.', 'error'); } finally { setRunning(false); } };
   const features = (data.features?.features || []) as any[]; const scenarios = (data.scenarios?.scenarios || []) as any[]; const readiness = asRecord(data.readiness);
-  return <div className="demo-page page-enter"><section className="demo-hero"><div className="demo-glow" /><div><div className="eyebrow compact"><i /> FINAL REVIEWER EXPERIENCE</div><h2>Final system <em>readiness.</em></h2><p>A reviewer-ready proof of local architecture, feature coverage, and controlled safety boundaries.</p><div className="phase-badge"><Sparkles size={15} /> Phase {data.status?.phase || 16} ready</div></div><div className="readiness-grid">{['FastAPI','PostgreSQL','Ollama','ChromaDB','LangGraph','MCP','No Raw SQL','No Smoke Writes'].map((name, index) => <div className="readiness-item" key={name}><span className="online-dot" /><div><b>{name}</b><small>{index > 5 ? 'Safety proof' : 'Local component'}</small></div></div>)}</div></section><section className="surface-card"><SectionHeading title="17-feature proof matrix" eyebrow="IMPLEMENTATION EVIDENCE" />{loading ? <TableSkeleton /> : <div className="feature-table">{features.length ? features.map((feature, index) => <div className="feature-row" key={feature.feature || index}><b>{feature.feature || feature.name || `Feature ${index + 1}`}</b><span>{feature.evidence || feature.implementation || 'Implemented capability evidence'}</span><StatusBadge status={feature.status || 'Ready'} /></div>) : <Empty icon={<Sparkles size={24} />} title="Feature matrix unavailable" text="Refresh when the backend demo endpoints are running." />}</div>}</section><section className="demo-columns"><div className="surface-card"><SectionHeading title="Guided mentor walkthrough" eyebrow="NON-DESTRUCTIVE DEMO ORDER" /><div className="demo-timeline">{scenarios.length ? scenarios.map((scenario, index) => <div className="demo-step" key={scenario.id || index}><span>{index + 1}</span><div><b>{scenario.title || scenario.name || `Demo step ${index + 1}`}</b><p>{scenario.what_it_proves || scenario.description || scenario.prompt || 'Reviewer-facing controlled scenario.'}</p></div><ChevronRight size={17} /></div>) : ['Show system readiness','Ask a structured database question','Ask a document RAG question','Ask a hybrid evidence question','Create a CRUD preview and cancel','Browse bounded records','Show audit and benchmark evidence'].map((label, index) => <div className="demo-step" key={label}><span>{index + 1}</span><div><b>{label}</b><p>Controlled local proof.</p></div><ChevronRight size={17} /></div>)}</div></div><div className="surface-card smoke-card"><SectionHeading title="Safe demo smoke check" eyebrow="NO MODEL GENERATION · NO BUSINESS WRITE" /><p>This checks integration readiness without raw SQL, model generation, rollback, or business-table writes.</p><button className="button primary" onClick={() => void runSmoke()} disabled={running}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />} {running ? 'Checking…' : 'Run safe smoke check'}</button>{smoke && <div className="smoke-result"><StatusBadge status={smoke.data?.overall_status || smoke.status} /><div><b>{smoke.answer}</b><small>Business write: {stringValue(smoke.data?.business_write_executed, 'false')} · Raw SQL: {stringValue(smoke.data?.raw_sql_accepted, 'false')} · Model generation: {stringValue(smoke.data?.model_generation_triggered, 'false')}</small></div></div>}</div></section>{Object.keys(readiness).length ? <section className="surface-card report-card"><SectionHeading title="Presentation report" eyebrow="LOCAL OBSERVED READINESS" /><pre>{JSON.stringify(readiness, null, 2)}</pre></section> : null}</div>;
+  return <div className="demo-page page-enter"><section className="demo-hero"><div className="demo-glow" /><div><div className="eyebrow compact"><i /> FINAL REVIEWER EXPERIENCE</div><h2>Final system <em>readiness.</em></h2><p>A reviewer-ready proof of local architecture, feature coverage, and controlled safety boundaries.</p><div className="phase-badge"><Sparkles size={15} /> Phase {data.status?.phase || 16} ready</div></div><div className="readiness-grid">{['FastAPI','PostgreSQL','Ollama','ChromaDB','LangGraph','MCP','No Raw SQL','No Smoke Writes'].map((name, index) => <div className="readiness-item" key={name}><span className="online-dot" /><div><b>{name}</b><small>{index > 5 ? 'Safety proof' : 'Local component'}</small></div></div>)}</div></section><section className="surface-card"><SectionHeading title="17-feature proof matrix" eyebrow="IMPLEMENTATION EVIDENCE" />{loading ? <TableSkeleton /> : <div className="feature-table">{features.length ? features.map((feature, index) => <div className="feature-row" key={feature.feature || index}><b>{feature.feature || feature.name || `Feature ${index + 1}`}</b><span>{feature.evidence || feature.implementation || 'Implemented capability evidence'}</span><StatusBadge status={feature.status || 'Ready'} /></div>) : <Empty icon={<Sparkles size={24} />} title="Feature matrix unavailable" text="Refresh when the backend demo endpoints are running." />}</div>}</section><section className="demo-columns"><div className="surface-card"><SectionHeading title="Guided mentor walkthrough" eyebrow="NON-DESTRUCTIVE DEMO ORDER" /><div className="demo-timeline">{scenarios.length ? scenarios.map((scenario, index) => <div className="demo-step" key={scenario.id || index}><span>{index + 1}</span><div><b>{scenario.title || scenario.name || `Demo step ${index + 1}`}</b><p>{scenario.what_it_proves || scenario.description || scenario.prompt || 'Reviewer-facing controlled scenario.'}</p></div><ChevronRight size={17} /></div>) : ['Show system readiness','Ask a structured database question','Ask a document RAG question','Ask a hybrid evidence question','Create a CRUD preview and cancel','Browse bounded records','Show audit and benchmark evidence'].map((label, index) => <div className="demo-step" key={label}><span>{index + 1}</span><div><b>{label}</b><p>Controlled local proof.</p></div><ChevronRight size={17} /></div>)}</div></div><div className="surface-card smoke-card"><SectionHeading title="Safe demo smoke check" eyebrow="NO MODEL GENERATION Â· NO BUSINESS WRITE" /><p>This checks integration readiness without raw SQL, model generation, rollback, or business-table writes.</p><button className="button primary" onClick={() => void runSmoke()} disabled={running}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />} {running ? 'Checkingâ€¦' : 'Run safe smoke check'}</button>{smoke && <div className="smoke-result"><StatusBadge status={smoke.data?.overall_status || smoke.status} /><div><b>{smoke.answer}</b><small>Business write: {stringValue(smoke.data?.business_write_executed, 'false')} Â· Raw SQL: {stringValue(smoke.data?.raw_sql_accepted, 'false')} Â· Model generation: {stringValue(smoke.data?.model_generation_triggered, 'false')}</small></div></div>}</div></section>{Object.keys(readiness).length ? <section className="surface-card report-card"><SectionHeading title="Presentation report" eyebrow="LOCAL OBSERVED READINESS" /><pre>{JSON.stringify(readiness, null, 2)}</pre></section> : null}</div>;
 }
 
 function AdminRequired({ onReturn }: { onReturn: () => void }) { return <div className="admin-required page-enter"><div className="lock-orb"><LockKeyhole size={34} /></div><div className="eyebrow compact"><i /> PROTECTED WORKSPACE</div><h2>Admin access required.</h2><p>This area includes protected audit, benchmarking, or recovery controls. Switch to an Admin workspace role to continue.</p><button className="button primary" onClick={onReturn}>Return to Command Center <ArrowRight size={16} /></button></div>; }
@@ -720,13 +703,15 @@ export function SkeletonLines() { return <div className="skeleton-lines"><i/><i/
 export function TableSkeleton() { return <div className="table-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><i/><i/><i/><i/><i/></div>)}</div>; }
 function LogoMark() { return <span className="logo-mark"><Sparkles size={18} /><i /><b /></span>; }
 function FileTypeIcon({ type }: { type?: string }) { const lower = (type || '').toLowerCase(); return <span className="file-icon">{lower.includes('pdf') ? <FileText size={21} /> : lower.includes('image') || lower.includes('png') || lower.includes('jpg') ? <FileSearch size={21} /> : lower.includes('doc') ? <FileCode2 size={21} /> : <FileText size={21} />}</span>; }
-export function DataPreview({ rows }: { rows: any[] }) { const normalizedRows = normalizeEvidenceRows(rows); if (!normalizedRows.length) return null; const columns = Array.from(new Set(normalizedRows.flatMap((row) => Object.keys(row)))).slice(0, 6); return <div className="data-preview"><div className="preview-head">{columns.map((column) => <span key={column}>{prettyKey(column)}</span>)}</div>{normalizedRows.map((row, index) => <div className="preview-row" key={row.id || row.employee_code || index}>{columns.map((column) => <span key={column}>{stringValue(row[column])}</span>)}</div>)}</div>; }
+export function DataPreview({ rows }: { rows: any[] }) { if (!rows.length) return null; const normalized = rows.filter((row) => row && typeof row === 'object' && !Array.isArray(row)); if (!normalized.length) return null; const columns = Array.from(new Set(normalized.flatMap((row) => Object.keys(row)))).slice(0, 6); return <div className="data-preview"><div className="preview-head" style={{ gridTemplateColumns: `repeat(${Math.max(1, columns.length)}, minmax(90px, 1fr))` }}>{columns.map((column) => <span key={column}>{prettyKey(column)}</span>)}</div>{normalized.map((row, index) => <div className="preview-row" style={{ gridTemplateColumns: `repeat(${Math.max(1, columns.length)}, minmax(90px, 1fr))` }} key={String(row.id || row.employee_code || row.vendor_code || row.customer_code || row.product_code || index)}>{columns.map((column) => <span key={column}>{stringValue(row[column])}</span>)}</div>)}</div>; }
 export function RecordTable({ rows, onRow }: { rows: any[]; onRow: (row: any) => void }) { if (!rows.length) return <Empty icon={<Table2 size={24} />} title="No visible records" text="The controlled backend returned no matching records for this view." />; const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 8); return <div className="record-table-wrap"><table className="record-table"><thead><tr>{columns.map((column) => <th key={column}>{prettyKey(column)}</th>)}<th /></tr></thead><tbody>{rows.map((row, index) => <tr key={row.id || row.employee_code || index} onClick={() => onRow(row)}>{columns.map((column) => <td key={column} className={column.includes('id') || column.includes('code') || column.includes('date') || column.includes('at') ? 'mono' : ''}>{stringValue(row[column])}</td>)}<td><ChevronRight size={16} /></td></tr>)}</tbody></table></div>; }
 function RecordDrawer({ row, onClose }: { row: Record<string, any>; onClose: () => void }) { return <div className="drawer-backdrop"><aside className="side-drawer"><button className="drawer-close" onClick={onClose}><X size={19} /></button><div className="eyebrow compact"><i /> RECORD DETAIL</div><h2>{row.name || row.employee_code || row.vendor_code || 'Selected record'}</h2><div className="detail-list">{Object.entries(row).map(([key, value]) => <div key={key}><span>{prettyKey(key)}</span><b className={key.includes('id') || key.includes('code') ? 'mono' : ''}>{stringValue(value)}</b></div>)}</div></aside></div>; }
 function DocumentDrawer({ document, details, user, onClose, toast }: { document: any; details: ApiEnvelope<any> | null; user: LocalUser; onClose: () => void; toast: (message: string, type?: Toast['type']) => void }) { const [text, setText] = useState<ApiEnvelope<any> | null>(null); const [chunks, setChunks] = useState<ApiEnvelope<any> | null>(null); const id = document.document_id || document.id; const fetchText = async () => { try { setText(await api.get(`/api/documents/${id}/extracted-text`, user.role)); } catch (e) { toast(e instanceof Error ? e.message : 'Extracted text unavailable.', 'error'); } }; const fetchChunks = async () => { try { setChunks(await api.get(`/api/rag/documents/${id}/chunks?limit=50`, user.role)); } catch (e) { toast(e instanceof Error ? e.message : 'Chunk detail unavailable.', 'error'); } };
   return <div className="drawer-backdrop"><aside className="side-drawer document-drawer"><button className="drawer-close" onClick={onClose}><X size={19} /></button><FileTypeIcon type={document.file_type} /><div className="eyebrow compact"><i /> DOCUMENT DETAIL</div><h2>{document.original_filename || document.filename}</h2><div className="detail-list">{Object.entries(asRecord(details?.data?.document || document)).slice(0, 12).map(([key, value]) => <div key={key}><span>{prettyKey(key)}</span><b>{stringValue(value)}</b></div>)}</div><div className="drawer-actions"><button className="button secondary" onClick={() => void fetchText()}>View extracted text</button><button className="button secondary" onClick={() => void fetchChunks()}>View chunks</button></div>{text && <div className="text-preview"><h4>Extracted text</h4><pre>{text.data?.text || text.data?.extracted_text || JSON.stringify(text.data, null, 2)}</pre></div>}{chunks && <div className="text-preview"><h4>Indexed chunks</h4><pre>{JSON.stringify(chunks.data?.chunks || chunks.data, null, 2)}</pre></div>}</aside></div>; }
 function AuditDrawer({ action, detail, user, onClose, toast }: { action: any; detail: ApiEnvelope<any> | null; user: LocalUser; onClose: () => void; toast: (message: string, type?: Toast['type']) => void }) { const [preview, setPreview] = useState<ApiEnvelope<any> | null>(null); const actionId = action.action_log_id || action.id; const createPreview = async () => { try { const response = await api.post(`/api/audit/actions/${actionId}/rollback/preview`, user.role, { session_id: sessionStorage.getItem(SESSION_KEY), ttl_minutes: 30 }); setPreview(response); toast(response.answer || 'Rollback preview created.', 'info'); } catch (e) { toast(e instanceof Error ? e.message : 'Rollback preview unavailable for this action.', 'error'); } };
-  return <div className="drawer-backdrop"><aside className="side-drawer audit-drawer"><button className="drawer-close" onClick={onClose}><X size={19} /></button><div className="eyebrow compact"><i /> AUDITED ACTION DETAIL</div><h2>{action.action_type || 'Action'} · {action.target_table || 'Business data'}</h2><StatusBadge status={action.status || action.confirmation_status || 'Recorded'} />{action.generated_sql && <pre className="readonly-code">{action.generated_sql}</pre>}<div className="detail-list">{Object.entries(asRecord(detail?.data?.action || action)).map(([key, value]) => <div key={key}><span>{prettyKey(key)}</span><b>{stringValue(value)}</b></div>)}</div><section className="rollback-box"><AlertTriangle size={18} /><div><b>Rollback control</b><p>Eligible audited updates and deletes can be restored only from stored before snapshots and require explicit admin confirmation.</p></div><button className="button danger" onClick={() => void createPreview()}>Preview rollback</button></section>{preview && <div className="rollback-preview"><StatusBadge status={preview.status} /><p>{preview.answer}</p><pre>{JSON.stringify(preview.data, null, 2)}</pre></div>}</aside></div>; }
+  return <div className="drawer-backdrop"><aside className="side-drawer audit-drawer"><button className="drawer-close" onClick={onClose}><X size={19} /></button><div className="eyebrow compact"><i /> AUDITED ACTION DETAIL</div><h2>{action.action_type || 'Action'} Â· {action.target_table || 'Business data'}</h2><StatusBadge status={action.status || action.confirmation_status || 'Recorded'} />{action.generated_sql && <pre className="readonly-code">{action.generated_sql}</pre>}<div className="detail-list">{Object.entries(asRecord(detail?.data?.action || action)).map(([key, value]) => <div key={key}><span>{prettyKey(key)}</span><b>{stringValue(value)}</b></div>)}</div><section className="rollback-box"><AlertTriangle size={18} /><div><b>Rollback control</b><p>Eligible audited updates and deletes can be restored only from stored before snapshots and require explicit admin confirmation.</p></div><button className="button danger" onClick={() => void createPreview()}>Preview rollback</button></section>{preview && <div className="rollback-preview"><StatusBadge status={preview.status} /><p>{preview.answer}</p><pre>{JSON.stringify(preview.data, null, 2)}</pre></div>}</aside></div>; }
 function ToastStack({ toasts }: { toasts: Toast[] }) { return <div className="toast-stack">{toasts.map((toast) => <div className={`toast ${toast.type}`} key={toast.id}>{toast.type === 'success' ? <Check size={17} /> : toast.type === 'error' ? <AlertTriangle size={17} /> : <Sparkles size={17} />}<span>{toast.message}</span></div>)}</div>; }
 
 export default App;
+
+
