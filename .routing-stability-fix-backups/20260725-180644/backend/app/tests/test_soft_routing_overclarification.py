@@ -5,13 +5,10 @@ from unittest.mock import patch
 
 from app.agents.orchestrator import agent_orchestrator
 from app.core.constants import AgentRoute, ResponseStatus, UserRole
-from app.schemas.phase5 import OllamaInvocationMetadata, SQLGenerationResult
 from app.services.soft_routing_service import (
     infer_readonly_business_table,
     should_route_open_question_to_documents,
 )
-from app.services.structured_read_service import StructuredReadResult
-from app.services.sql_validation import SQLValidationResult
 
 
 def test_open_policy_question_routes_to_document_rag_without_generic_clarification():
@@ -43,27 +40,15 @@ def test_open_policy_question_routes_to_document_rag_without_generic_clarificati
 def test_people_department_question_infers_employees_table():
     assert infer_readonly_business_table("who works under finance?") == "employees"
 
-    fake_result = StructuredReadResult(
-        question="who works under finance?",
-        proposal=SQLGenerationResult(
-            route="structured_read",
-            sql="select * from employees where department = 'Finance'",
-            explanation="department filter",
-        ),
-        validation=SQLValidationResult(
-            is_valid=True,
-            statement_type="select",
-            normalized_sql="select * from employees where department = 'Finance'",
-            tables=["employees"],
-        ),
-        glossary={},
-        model_metadata=OllamaInvocationMetadata(model="llama3:8b", attempts=1),
-        rows=[],
-        row_count=2,
-        source={"tables": ["employees"]},
-        answer="Found employees in Finance.",
+    fake_result = SimpleNamespace(
         status=ResponseStatus.SUCCESS,
-        audit={},
+        answer="Found employees in Finance.",
+        row_count=2,
+        rows=[],
+        source={"tables": ["employees"]},
+        validation=SimpleNamespace(normalized_sql="select * from employees where department = 'Finance'"),
+        proposal=SimpleNamespace(sql="select * from employees where department = 'Finance'", explanation="department filter"),
+        question="who works under finance?",
     )
     with patch("app.agents.orchestrator.structured_read_service.execute", return_value=fake_result) as execute:
         result = agent_orchestrator.run(

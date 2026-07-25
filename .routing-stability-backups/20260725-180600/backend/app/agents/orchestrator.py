@@ -9,7 +9,6 @@ ChromaDB sources, and hybrid answers use restricted MCP evidence fusion.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
@@ -53,8 +52,6 @@ from app.services.demo_question_service import (
     detect_demo_question,
     execute_demo_question,
 )
-from app.services.explicit_insert_service import detect_explicit_insert
-from app.services.soft_routing_service import infer_readonly_business_table
 from app.services.parent_child_crud_service import (
     ParentChildError,
     looks_like_parent_child_request,
@@ -124,37 +121,10 @@ class AgentOrchestrator:
         self._graph = self._build_graph()
 
     @staticmethod
-    def _looks_like_hybrid_question(question: str) -> bool:
-        normalized = " ".join(str(question or "").casefold().split())
-        if not normalized:
-            return False
-        database_signal = bool(
-            re.search(r"\b(?:employees?|workers?|staff|vendors?|suppliers?|customers?|clients?|products?|items?|sales\s+deals?)\b", normalized)
-            and re.search(r"\b(?:show|list|count|how\s+many|active|inactive|from|in|approved|price|department|city)\b", normalized)
-        )
-        document_signal = bool(
-            re.search(r"\b(?:summarize|explain|policy|documents?|uploaded|faq|onboarding|compliance|checklist|catalog|ticket|support|response\s+time|tasks?|requirements?|submit|submitted)\b", normalized)
-        )
-        connector = bool(re.search(r"\b(?:and|also|along\s+with|together\s+with)\b", normalized))
-        return database_signal and document_signal and connector
-
-    @staticmethod
-    def _looks_like_dangerous_sql(question: str) -> bool:
-        return bool(re.search(r"\b(?:drop|truncate|alter)\s+(?:table\s+)?[a-z][a-z0-9_]*\b", str(question or "").casefold()))
-
-    @staticmethod
     def _append_trace(state: AgentState, node: str, detail: str) -> list[dict[str, Any]]:
-        """Return a new graph_trace list with one more entry appended.
-
-        LangGraph state updates are merged by replacing the ``graph_trace`` key with
-        whatever this returns, so a new list is built rather than mutating
-        ``state["graph_trace"]`` in place -- mutating the existing list would let two
-        concurrent branches silently share and corrupt each other's trace history.
-        """
-
-        existing = list(state.get("graph_trace") or [])
-        existing.append({"node": node, "detail": detail})
-        return existing
+        trace = list(state.get("graph_trace") or [])
+        trace.append({"node": node, "detail": detail})
+        return trace
 
     def _classify(self, state: AgentState) -> dict[str, Any]:
         schema_request = detect_schema_metadata_question(state["question"])
@@ -173,40 +143,6 @@ class AgentOrchestrator:
                     "schema_intent_guard",
                     "Detected a table/column metadata question from the current turn; prior filters were ignored and Ollama was not called.",
                 ),
-            }
-
-        if self._looks_like_dangerous_sql(state["question"]):
-            return {
-                "route": AgentRoute.SYSTEM.value,
-                "route_confidence": 1.0,
-                "routing_reason": "Dangerous SQL was rejected before route execution.",
-                "clarification_code": "dangerous_sql_rejected",
-                "clarification_message": "Dangerous SQL or schema-destructive commands are not allowed through the assistant.",
-                "clarification_missing_fields": [],
-                "clarification_details": [{"blocked_before_ollama": True, "database_touched": False}],
-                "resolved_tables": [],
-                "detected_intent": "unsafe_sql",
-                "graph_trace": self._append_trace(state, "safety_guard", "Rejected dangerous SQL before Ollama, SQL validation, or database access."),
-            }
-
-        if self._looks_like_hybrid_question(state["question"]):
-            return {
-                "route": AgentRoute.HYBRID.value,
-                "route_confidence": 0.93,
-                "routing_reason": "The question explicitly asks for both structured database facts and uploaded-document evidence.",
-                "detected_intent": "hybrid_database_document",
-                "graph_trace": self._append_trace(state, "hybrid_intent_guard", "Detected combined database and document intent before deterministic demo-read routing."),
-            }
-
-        inferred_table = infer_readonly_business_table(state["question"])
-        if inferred_table and state.get("db") is None:
-            return {
-                "route": AgentRoute.STRUCTURED_READ.value,
-                "route_confidence": 0.91,
-                "routing_reason": "A narrow read-only people/department question inferred the employees table without guessing a write target.",
-                "resolved_tables": [inferred_table],
-                "detected_intent": "soft_readonly_business_table",
-                "graph_trace": self._append_trace(state, "soft_readonly_table_inference", f"Inferred {inferred_table} for a read-only personnel question."),
             }
 
         demo_request = detect_demo_question(state["question"])
@@ -572,58 +508,6 @@ class AgentOrchestrator:
         session_id = self._parse_or_create_session(state)
         user_role = UserRole(state.get("user_role", UserRole.NORMAL_USER.value))
 
-        explicit_insert = detect_explicit_insert(state["question"])
-        if explicit_insert is not None:
-            try:
-                result = crud_write_service.propose_bulk_insert(
-                    state["db"],
-                    session_id=UUID(session_id),
-                    target_table=explicit_insert.target_table,
-                    records=explicit_insert.records,
-                    actor_role=user_role,
-                    user_prompt=state["question"],
-                    generation_metadata={
-                        "requested_record_count": len(explicit_insert.records),
-                        "generated_record_count": len(explicit_insert.records),
-                        "source": "deterministic_explicit_insert_parser",
-                        "summary": explicit_insert.summary,
-                    },
-                )
-            except CrudWriteError as exc:
-                raise AgentOrchestrationError(status=exc.status, code=exc.code, message=exc.message, details=exc.details or []) from exc
-
-            preview_count = int(result.preview.get("record_count") or 0)
-            return {
-                "session_id": session_id,
-                "status": ResponseStatus.PENDING_CONFIRMATION.value,
-                "answer": (
-                    f"Created a deterministic insert preview for `{explicit_insert.target_table}` with {preview_count} record"
-                    f"{'s' if preview_count != 1 else ''}. No database row was changed; explicit admin confirmation is required."
-                ),
-                "generated_sql": None,
-                "pending_action_id": result.pending_action["pending_action_id"],
-                "sources": [],
-                "data": {
-                    "question": state["question"],
-                    "route_decision": self._route_metadata(state),
-                    "session_id": session_id,
-                    "target_table": explicit_insert.target_table,
-                    "pending_action": result.pending_action,
-                    "preview": result.preview,
-                    "validation": None,
-                    "duplicate_matches": result.duplicate_matches,
-                    "requested_record_count": len(explicit_insert.records),
-                    "generated_record_count": len(explicit_insert.records),
-                    "preview_record_count": preview_count,
-                    "count_verified": len(explicit_insert.records) == preview_count,
-                    "rows": result.preview.get("records", []),
-                    "parser": "deterministic_explicit_insert_parser",
-                    "write_execution_allowed": False,
-                    "next_step": "Review the preview, then confirm as admin or cancel this exact pending action.",
-                },
-                "graph_trace": self._append_trace(state, "explicit_insert", "Built a deterministic single-record insert preview and reused the confirmation-gated bulk-insert path; no LLM SQL was generated."),
-            }
-
         # Explicit random/demo generation is deterministic and schema-aware. Faker
         # produces records for the requested approved business table, foreign keys use
         # existing parent rows, and the result still enters the normal exact-count,
@@ -877,79 +761,12 @@ class AgentOrchestrator:
         }
 
     def _hybrid_evidence_fusion(self, state: AgentState) -> dict[str, Any]:
-        """Combine a deterministic database read with uploaded-document RAG when possible.
+        """Fuse document and database facts only through verified product identity.
 
-        The original Phase 11 hybrid service is product-identity specific. Demo prompts now
-        also ask broad combinations such as "How many active employees are in IT, and what
-        onboarding tasks should they complete?". For those, use the existing deterministic
-        demo-read service for the database side and the grounded RAG service for the document
-        side. If no deterministic database side is available, fall back to the original
-        restricted product/vendor hybrid service.
+        ChromaDB supplies the candidate document chunks. The Phase 11 restricted MCP tool
+        then returns vendor/product/price facts only where a product name or code is
+        explicitly present in those chunks. This prevents a model from inventing a join.
         """
-
-        database_question = re.split(r"\s*,?\s+and\s+|\s+also\s+|\s+along\s+with\s+", state["question"], maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,.;") or state["question"]
-        demo_request = detect_demo_question(database_question)
-        if demo_request.handled and demo_request.table and state.get("db") is not None:
-            try:
-                database_result = execute_demo_question(
-                    state["db"],
-                    request=demo_request,
-                    question=database_question,
-                    memory_context=state.get("memory_context"),
-                )
-            except DemoQuestionError as exc:
-                raise AgentOrchestrationError(status=exc.status, code=exc.code, message=exc.message) from exc
-
-            try:
-                document_result = document_rag_service.answer_question(state["question"], top_k=state.get("top_k"))
-            except DocumentRagError as exc:
-                raise AgentOrchestrationError(status=exc.status, code=exc.code, message=exc.message, details=exc.details or []) from exc
-
-            document_sources = [
-                {
-                    "source_type": "document",
-                    "reference": match.reference,
-                    "detail": f"Local retrieval similarity {match.similarity:.3f}; filename/page/chunk source.",
-                }
-                for match in document_result.matches
-                if not document_result.source_references or match.reference in document_result.source_references
-            ]
-            database_sources = list(database_result.sources or [])
-            database_ok = database_result.status == ResponseStatus.SUCCESS
-            document_ok = document_result.status == ResponseStatus.SUCCESS
-            combined_status = ResponseStatus.SUCCESS if database_ok or document_ok else ResponseStatus.INFORMATION_NOT_AVAILABLE
-            answer_parts = []
-            if database_result.answer:
-                answer_parts.append(f"Database result: {database_result.answer}")
-            if document_result.answer:
-                answer_parts.append(f"Document result: {document_result.answer}")
-            answer = "\n\n".join(answer_parts) if answer_parts else "Information not available in the current database or uploaded documents."
-            return {
-                "status": combined_status.value,
-                "answer": answer,
-                "sources": database_sources + document_sources,
-                "generated_sql": database_result.generated_sql,
-                "pending_action_id": None,
-                "data": {
-                    "question": state["question"],
-                    "route_decision": self._route_metadata(state),
-                    "database_result": database_result.data,
-                    "document_result": {
-                        "status": document_result.status.value,
-                        "answer": document_result.answer,
-                        "retrieved_chunk_count": len(document_result.matches),
-                        "retrieved_chunks": [match.to_dict() for match in document_result.matches],
-                        "source_references": document_result.source_references,
-                    },
-                    "grounding_policy": "database_answer_from_deterministic_sqlalchemy_and_document_answer_from_retrieved_rag_evidence",
-                },
-                "graph_trace": self._append_trace(
-                    state,
-                    "hybrid_generic_fusion",
-                    "Answered the database part with deterministic SQLAlchemy handling and the document part with grounded uploaded-document RAG.",
-                ),
-            }
-
         try:
             document_matches = document_rag_service.retrieve(state["question"], top_k=state.get("top_k"))
             result = hybrid_evidence_service.fuse(
@@ -989,7 +806,6 @@ class AgentOrchestrator:
             "answer": result.answer,
             "sources": [citation.model_dump() for citation in citations],
             "generated_sql": None,
-            "pending_action_id": None,
             "data": data,
             "graph_trace": self._append_trace(state, "hybrid_evidence_fusion", trace_detail),
         }

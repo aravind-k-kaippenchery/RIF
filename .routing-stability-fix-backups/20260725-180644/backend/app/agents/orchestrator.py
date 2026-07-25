@@ -142,20 +142,6 @@ class AgentOrchestrator:
     def _looks_like_dangerous_sql(question: str) -> bool:
         return bool(re.search(r"\b(?:drop|truncate|alter)\s+(?:table\s+)?[a-z][a-z0-9_]*\b", str(question or "").casefold()))
 
-    @staticmethod
-    def _append_trace(state: AgentState, node: str, detail: str) -> list[dict[str, Any]]:
-        """Return a new graph_trace list with one more entry appended.
-
-        LangGraph state updates are merged by replacing the ``graph_trace`` key with
-        whatever this returns, so a new list is built rather than mutating
-        ``state["graph_trace"]`` in place -- mutating the existing list would let two
-        concurrent branches silently share and corrupt each other's trace history.
-        """
-
-        existing = list(state.get("graph_trace") or [])
-        existing.append({"node": node, "detail": detail})
-        return existing
-
     def _classify(self, state: AgentState) -> dict[str, Any]:
         schema_request = detect_schema_metadata_question(state["question"])
         if schema_request.handled:

@@ -390,35 +390,6 @@ def _constraints_from_prompt(question: str, target_table: str) -> dict[str, Any]
     return constraints
 
 
-
-
-def _is_explicit_synthetic_generation(normalized: str, tokens: set[str]) -> bool:
-    """Recognize only explicit bulk Faker requests.
-
-    Do not treat the token "demo" inside a supplied name, such as "Demo User" or
-    "Demo Retail Pvt Ltd", as a request to generate random records.
-    """
-
-    if tokens & {"synthetic", "fake", "faker", "random", "randomly", "randomized", "generate", "generated", "seed", "populate"}:
-        return True
-
-    if "demo" in tokens or "sample" in tokens:
-        table_words = (
-            "employees?", "workers?", "vendors?", "suppliers?", "customers?", "clients?",
-            "products?", "items?", "sales\\s+deals?", "records?", "rows?", "data",
-        )
-        table_pattern = r"(?:" + "|".join(table_words) + r")"
-        if re.search(rf"\b(?:generate|seed|populate)\b.*\b(?:demo|sample)\b.*\b{table_pattern}\b", normalized.casefold()):
-            return True
-        if re.search(rf"\b(?:generate|seed|populate)\b.*\b{table_pattern}\b", normalized.casefold()):
-            return True
-        if re.search(rf"\b(?:create|add|make)\s+\d+\s+(?:demo|sample)\s+{table_pattern}\b", normalized.casefold()):
-            return True
-        if re.search(rf"\b(?:demo|sample)\s+{table_pattern}\b", normalized.casefold()) and re.search(r"\b(?:records?|data|rows?)\b", normalized.casefold()):
-            return True
-
-    return False
-
 def parse_synthetic_data_prompt(question: str) -> SyntheticDataRequest | None:
     """Recognize a safe schema-aware Faker request.
 
@@ -435,7 +406,7 @@ def parse_synthetic_data_prompt(question: str) -> SyntheticDataRequest | None:
         return None
 
     tokens = set(re.findall(r"[a-z0-9_-]+", normalized.casefold()))
-    has_generation_signal = _is_explicit_synthetic_generation(normalized, tokens)
+    has_generation_signal = bool(tokens & _GENERATION_SIGNALS)
     if not has_generation_signal:
         return None
 

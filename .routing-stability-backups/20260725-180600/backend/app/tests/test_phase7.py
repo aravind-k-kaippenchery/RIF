@@ -113,7 +113,7 @@ def test_confirmed_action_is_idempotent_without_reexecuting():
             db,
             session_id=action.session_id,
             pending_action_id=action.id,
-            actor_role=UserRole.ADMIN,
+            actor_role=UserRole.NORMAL_USER,
             request_id="phase7-idempotent",
         )
     assert result.idempotent is True
@@ -267,7 +267,7 @@ def test_bulk_confirmation_uses_returning_and_verifies_exact_inserted_count(coun
             db,
             session_id=uuid4(),
             pending_action_id=action.id,
-            actor_role=UserRole.ADMIN,
+            actor_role=UserRole.NORMAL_USER,
             request_id="bulk-count-confirm",
         )
 
@@ -325,7 +325,7 @@ def test_bulk_confirmation_rolls_back_when_postgres_returns_fewer_rows_than_requ
                 db,
                 session_id=uuid4(),
                 pending_action_id=action.id,
-                actor_role=UserRole.ADMIN,
+                actor_role=UserRole.NORMAL_USER,
                 request_id="bulk-count-rollback",
             )
 

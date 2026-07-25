@@ -20,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.constants import AgentRoute, ResponseStatus
-from app.models.business import Customer, Employee, EmployeeExperience, Product, SalesDeal, Vendor
+from app.models.business import Customer, Employee, Product, SalesDeal, Vendor
 from app.models.operations import QueryLog
 from app.services.schema_registry import BUSINESS_TABLES, OPERATIONAL_TABLES
 
@@ -178,33 +178,12 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
         return DemoQuestionRequest(False)
 
     write_terms = {"add", "create", "insert", "update", "delete", "remove", "change", "modify", "set", "confirm", "approve", "generate", "seed", "populate"}
-    # Synthetic generation and writes are handled elsewhere; do not intercept them here.
+    # Synthetic generation is handled elsewhere; do not intercept it here.
     if _contains_any(text, write_terms):
         return DemoQuestionRequest(False)
 
-    document_first_terms = {
-        "document", "documents", "uploaded", "upload", "pdf", "file", "files", "faq", "policy",
-        "keyword", "ticket", "tickets", "escalate", "escalated", "escalation", "support",
-        "onboarding", "compliance", "checklist", "catalog", "submit", "submitted", "required", "requirements",
-    }
-    if (
-        _contains_any(text, document_first_terms)
-        and re.search(r"\b(?:what|when|which|how|find|search|tell|summarize|explain)\b", text)
-        and not re.search(r"\b(?:show|list|count|how\s+many)\b.*\b(?:employees?|vendors?|customers?|products?|sales\s+deals?)\b", text)
-    ):
-        return DemoQuestionRequest(False)
-
-    if (
-        re.search(r"\bwhat\s+can\s+you\s+do\b", text)
-        or re.fullmatch(r"(?:help|capabilities|features)\??", text)
-        or re.search(r"\bwhat\s+types?\s+of\s+database\s+operations\b", text)
-        or re.search(r"\bcan\s+you\s+(?:read\s+uploaded\s+documents|create\s+and\s+update\s+database\s+records|generate\s+synthetic\s+data)\b", text)
-        or re.search(r"\b(?:do\s+you\s+work\s+offline|which\s+local\s+ai\s+model|are\s+you\s+using\s+a\s+cloud\s+llm)\b", text)
-    ):
+    if re.search(r"\bwhat\s+can\s+you\s+do\b", text) or re.fullmatch(r"(?:help|capabilities|features)\??", text):
         return DemoQuestionRequest(True, kind="capabilities", route=AgentRoute.SYSTEM)
-
-    if re.search(r"\b(?:fastapi|postgresql|postgres|ollama|chromadb|langgraph|mcp)\b", text) and re.search(r"\b(?:connected|available|ready|status|health)\b", text):
-        return DemoQuestionRequest(True, kind="system_health_hint", route=AgentRoute.SYSTEM)
 
     if (
         re.search(r"\b(?:which|what|show|list)\s+(?:are\s+)?(?:the\s+)?business\s+tables\b", text)
@@ -249,23 +228,11 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
             limit=_limit_from_question(text, 10),
         )
 
-    # Employee experience / work-history questions must be checked before the broader employee detector.
-    if re.search(r"\b(?:employee\s+experiences?|experiences?|work\s+history|previous\s+companies|previous\s+jobs)\b", text):
-        if re.search(r"\b(?:how\s+many|count)\b", text):
-            return DemoQuestionRequest(True, kind="employee_experience_count", table="employee_experiences")
-        if re.search(r"\bcount\b.*\bcompany\b", text):
-            return DemoQuestionRequest(True, kind="employee_experience_count_by_company", table="employee_experiences")
-        return DemoQuestionRequest(True, kind="employee_experience_list", table="employee_experiences", limit=_limit_from_question(text))
-
     # Employees / workers / staff.
     if re.search(r"\b(?:employees?|workers?|staff|people)\b", text):
-        if re.search(r"\b(?:count\s+employees?\s+by\s+department|number\s+of\s+employees\s+in\s+each\s+department|employees\s+in\s+each\s+department|department\s+has\s+the\s+most\s+employees)\b", text):
+        if re.search(r"\bcount\s+employees?\s+by\s+department\b", text):
             return DemoQuestionRequest(True, kind="employee_count_by_department", table="employees")
-        if re.search(r"\b(?:count\s+employees?\s+by\s+city|city\s+has\s+the\s+most\s+employees|employees\s+in\s+each\s+city)\b", text):
-            return DemoQuestionRequest(True, kind="employee_count_by_city", table="employees")
-        if re.search(r"\bcount\s+employees?\s+by\s+status\b", text):
-            return DemoQuestionRequest(True, kind="employee_count_by_status", table="employees")
-        if re.search(r"\b(?:how\s+many|count\s+all|count)\s+(?:active\s+|inactive\s+)?employees?\b", text):
+        if re.search(r"\bhow\s+many\s+employees?\b", text):
             filters: dict[str, Any] = {}
             department = _department_from_question(text)
             city = _city_from_question(text)
@@ -318,10 +285,6 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
         name_like = _vendor_name_contains(text)
         if name_like:
             filters["vendor_name_contains"] = name_like
-        if re.search(r"\bcount\s+vendors?\s+by\s+(?:approval\s+)?status\b", text):
-            return DemoQuestionRequest(True, kind="vendor_count_by_status", table="vendors")
-        if re.search(r"\b(?:how\s+many|count\s+all|count)\s+(?:active\s+|inactive\s+|approved\s+)?vendors?\b", text):
-            return DemoQuestionRequest(True, kind="vendor_count", table="vendors", filters=filters)
         return DemoQuestionRequest(True, kind="vendor_list", table="vendors", filters=filters, limit=_limit_from_question(text))
 
     # Customers / clients.
@@ -336,14 +299,6 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
             filters["status"] = "inactive"
         return DemoQuestionRequest(True, kind="customer_list", table="customers", filters=filters, limit=_limit_from_question(text))
 
-    # Product aggregate questions may say only "list price" without the word product.
-    if re.search(r"\b(?:average|avg|highest|lowest)\s+(?:list\s+)?price\b", text):
-        if re.search(r"\b(?:highest|max|maximum)\b", text):
-            return DemoQuestionRequest(True, kind="product_highest_price", table="products")
-        if re.search(r"\b(?:lowest|min|minimum|cheapest)\b", text):
-            return DemoQuestionRequest(True, kind="product_lowest_price", table="products")
-        return DemoQuestionRequest(True, kind="product_average_price", table="products")
-
     # Products / items.
     if re.search(r"\b(?:products?|items?)\b", text):
         filters = {}
@@ -354,16 +309,6 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
             filters["is_active"] = True
         if "inactive" in text:
             filters["is_active"] = False
-        if re.search(r"\bcount\s+products?\s+by\s+category\b", text):
-            return DemoQuestionRequest(True, kind="product_count_by_category", table="products")
-        if re.search(r"\b(?:how\s+many|count\s+all|count)\s+(?:active\s+|inactive\s+)?products?\b", text):
-            return DemoQuestionRequest(True, kind="product_count", table="products", filters=filters)
-        if re.search(r"\b(?:average|avg)\s+(?:list\s+)?price\b", text):
-            return DemoQuestionRequest(True, kind="product_average_price", table="products")
-        if re.search(r"\b(?:highest|max|maximum)\s+(?:list\s+)?price\b", text):
-            return DemoQuestionRequest(True, kind="product_highest_price", table="products")
-        if re.search(r"\b(?:lowest|min|minimum|cheapest)\s+(?:list\s+)?price\b", text):
-            return DemoQuestionRequest(True, kind="product_lowest_price", table="products")
         return DemoQuestionRequest(True, kind="product_list", table="products", filters=filters, limit=_limit_from_question(text))
 
     return DemoQuestionRequest(False)
@@ -579,32 +524,6 @@ def _execute_employee_query(db: Session, request: DemoQuestionRequest, memory_co
             data={"target_table": "employees", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
         )
 
-    if request.kind == "employee_count_by_city":
-        rows = list(db.execute(select(Employee.city, func.count()).group_by(Employee.city).order_by(Employee.city)).all())
-        data_rows = [{"city": str(city), "employee_count": int(count)} for city, count in rows]
-        text = ", ".join(f"{item['city']}: {item['employee_count']}" for item in data_rows)
-        return DemoQuestionResult(
-            route=AgentRoute.STRUCTURED_READ,
-            status=ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            answer=f"Employee count by city: {text}." if data_rows else "Information not available in the current database.",
-            generated_sql="SELECT city, count(*) AS employee_count FROM employees GROUP BY city ORDER BY city",
-            sources=_source("employees"),
-            data={"target_table": "employees", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-        )
-
-    if request.kind == "employee_count_by_status":
-        rows = list(db.execute(select(Employee.employment_status, func.count()).group_by(Employee.employment_status).order_by(Employee.employment_status)).all())
-        data_rows = [{"employment_status": str(status), "employee_count": int(count)} for status, count in rows]
-        text = ", ".join(f"{item['employment_status']}: {item['employee_count']}" for item in data_rows)
-        return DemoQuestionResult(
-            route=AgentRoute.STRUCTURED_READ,
-            status=ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            answer=f"Employee count by status: {text}." if data_rows else "Information not available in the current database.",
-            generated_sql="SELECT employment_status, count(*) AS employee_count FROM employees GROUP BY employment_status ORDER BY employment_status",
-            sources=_source("employees"),
-            data={"target_table": "employees", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-        )
-
     query = query.order_by(Employee.id).limit(max(1, min(100, request.limit)))
     items = list(db.scalars(query).all())
     rows = _rows_from_models(items, ["id", "employee_code", "first_name", "last_name", "email", "department", "city", "company_name", "salary", "employment_status"])
@@ -622,26 +541,12 @@ def _execute_employee_query(db: Session, request: DemoQuestionRequest, memory_co
 
 def _execute_vendor_query(db: Session, request: DemoQuestionRequest) -> DemoQuestionResult:
     filters = dict(request.filters or {})
+    query = select(Vendor)
     conditions = []
     if filters.get("status"):
         conditions.append(func.lower(Vendor.status) == str(filters["status"]).lower())
     if filters.get("vendor_name_contains"):
         conditions.append(Vendor.vendor_name.ilike(f"%{filters['vendor_name_contains']}%"))
-
-    if request.kind == "vendor_count_by_status":
-        rows = list(db.execute(select(Vendor.status, func.count()).group_by(Vendor.status).order_by(Vendor.status)).all())
-        data_rows = [{"status": str(status), "vendor_count": int(count)} for status, count in rows]
-        text = ", ".join(f"{item['status']}: {item['vendor_count']}" for item in data_rows)
-        return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE, f"Vendor count by status: {text}." if data_rows else "Information not available in the current database.", {"target_table": "vendors", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("vendors"), "SELECT status, count(*) AS vendor_count FROM vendors GROUP BY status ORDER BY status")
-
-    if request.kind == "vendor_count":
-        query = select(func.count()).select_from(Vendor)
-        if conditions:
-            query = query.where(and_(*conditions))
-        count = int(db.scalar(query) or 0)
-        return _count_result(table="vendors", count=count, filters=filters, sql="SELECT count(*) FROM vendors" + _sql_where(filters))
-
-    query = select(Vendor)
     if conditions:
         query = query.where(and_(*conditions))
     items = list(db.scalars(query.order_by(Vendor.id).limit(max(1, min(100, request.limit)))).all())
@@ -649,6 +554,7 @@ def _execute_vendor_query(db: Session, request: DemoQuestionRequest) -> DemoQues
     alias_note = "This schema uses `status = active` as the approved/available vendor signal." if filters.get("approved_alias") else None
     status, answer = _list_answer(table="vendors", rows=rows, filters=filters, alias_note=alias_note)
     return DemoQuestionResult(AgentRoute.STRUCTURED_READ, status, answer, {"target_table": "vendors", "row_count": len(rows), "rows": rows, "filters": filters, "database_source": {"source_type": "database", "tables": ["vendors"]}, "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("vendors"), "SELECT * FROM vendors" + _sql_where(filters) + f" ORDER BY id LIMIT {max(1, min(100, request.limit))}")
+
 
 def _execute_customer_query(db: Session, request: DemoQuestionRequest) -> DemoQuestionResult:
     filters = dict(request.filters or {})
@@ -668,48 +574,19 @@ def _execute_customer_query(db: Session, request: DemoQuestionRequest) -> DemoQu
 
 def _execute_product_query(db: Session, request: DemoQuestionRequest) -> DemoQuestionResult:
     filters = dict(request.filters or {})
+    query = select(Product)
     conditions = []
     if filters.get("list_price_gt") is not None:
         conditions.append(Product.list_price > Decimal(str(filters["list_price_gt"])))
     if "is_active" in filters:
         conditions.append(Product.is_active.is_(bool(filters["is_active"])))
-
-    if request.kind == "product_count_by_category":
-        rows = list(db.execute(select(Product.category, func.count()).group_by(Product.category).order_by(Product.category)).all())
-        data_rows = [{"category": str(category), "product_count": int(count)} for category, count in rows]
-        text = ", ".join(f"{item['category']}: {item['product_count']}" for item in data_rows)
-        return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE, f"Product count by category: {text}." if data_rows else "Information not available in the current database.", {"target_table": "products", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("products"), "SELECT category, count(*) AS product_count FROM products GROUP BY category ORDER BY category")
-
-    if request.kind == "product_count":
-        query = select(func.count()).select_from(Product)
-        if conditions:
-            query = query.where(and_(*conditions))
-        count = int(db.scalar(query) or 0)
-        return _count_result(table="products", count=count, filters=filters, sql="SELECT count(*) FROM products" + _sql_where(filters))
-
-    if request.kind == "product_average_price":
-        value = db.scalar(select(func.avg(Product.list_price)))
-        if value is None:
-            return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.INFORMATION_NOT_AVAILABLE, "Information not available in the current database.", {"target_table": "products", "row_count": 0, "rows": []}, _source("products"), "SELECT avg(list_price) FROM products")
-        avg = float(value)
-        return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.SUCCESS, f"The average product list price is ₹{avg:.2f}.", {"target_table": "products", "row_count": 1, "rows": [{"average_list_price": avg}], "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("products"), "SELECT avg(list_price) AS average_list_price FROM products")
-
-    if request.kind in {"product_highest_price", "product_lowest_price"}:
-        order = desc(Product.list_price) if request.kind == "product_highest_price" else Product.list_price.asc()
-        item = db.scalar(select(Product).order_by(order).limit(1))
-        if item is None:
-            return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.INFORMATION_NOT_AVAILABLE, "Information not available in the current database.", {"target_table": "products", "row_count": 0, "rows": []}, _source("products"), "SELECT * FROM products ORDER BY list_price LIMIT 1")
-        row = _rows_from_models([item], ["id", "product_code", "product_name", "category", "list_price", "is_active"])[0]
-        adjective = "highest" if request.kind == "product_highest_price" else "lowest"
-        return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.SUCCESS, f"The {adjective} product list price is ₹{row.get('list_price')} for {row.get('product_name')}.", {"target_table": "products", "row_count": 1, "rows": [row], "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("products"), f"SELECT * FROM products ORDER BY list_price {'DESC' if request.kind == 'product_highest_price' else 'ASC'} LIMIT 1")
-
-    query = select(Product)
     if conditions:
         query = query.where(and_(*conditions))
     items = list(db.scalars(query.order_by(Product.id).limit(max(1, min(100, request.limit)))).all())
     rows = _rows_from_models(items, ["id", "product_code", "product_name", "category", "description", "list_price", "is_active"])
     status, answer = _list_answer(table="products", rows=rows, filters=filters)
     return DemoQuestionResult(AgentRoute.STRUCTURED_READ, status, answer, {"target_table": "products", "row_count": len(rows), "rows": rows, "filters": filters, "database_source": {"source_type": "database", "tables": ["products"]}, "execution": {"ollama_called": False, "deterministic_demo_query": True, "column_aliases": {"price": "list_price"}}}, _source("products"), "SELECT * FROM products" + _sql_where(filters) + f" ORDER BY id LIMIT {max(1, min(100, request.limit))}")
+
 
 def _execute_sales_deals_query(db: Session, request: DemoQuestionRequest) -> DemoQuestionResult:
     limit = max(1, min(100, request.limit))
@@ -719,53 +596,6 @@ def _execute_sales_deals_query(db: Session, request: DemoQuestionRequest) -> Dem
     status, answer = _list_answer(table="sales_deals", rows=rows, filters={}, alias_note=alias_note)
     return DemoQuestionResult(AgentRoute.STRUCTURED_READ, status, answer, {"target_table": "sales_deals", "row_count": len(rows), "rows": rows, "database_source": {"source_type": "database", "tables": ["sales_deals"]}, "execution": {"ollama_called": False, "deterministic_demo_query": True, "orders_alias_to_sales_deals": request.kind == "recent_sales_deals_alias_orders"}}, _source("sales_deals"), f"SELECT * FROM sales_deals ORDER BY created_at DESC, expected_close_date DESC LIMIT {limit}")
 
-
-
-
-def _execute_employee_experience_query(db: Session, request: DemoQuestionRequest) -> DemoQuestionResult:
-    if request.kind == "employee_experience_count":
-        count = int(db.scalar(select(func.count()).select_from(EmployeeExperience)) or 0)
-        return DemoQuestionResult(
-            AgentRoute.STRUCTURED_READ,
-            ResponseStatus.SUCCESS,
-            f"There are {count} employee experience records.",
-            {"target_table": "employee_experiences", "row_count": count, "rows": [], "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-            _source("employee_experiences"),
-            "SELECT count(*) FROM employee_experiences",
-        )
-    if request.kind == "employee_experience_count_by_company":
-        rows = list(db.execute(select(EmployeeExperience.company_name, func.count()).group_by(EmployeeExperience.company_name).order_by(EmployeeExperience.company_name)).all())
-        data_rows = [{"company_name": str(company), "experience_count": int(count)} for company, count in rows]
-        text = ", ".join(f"{item['company_name']}: {item['experience_count']}" for item in data_rows[:10])
-        return DemoQuestionResult(
-            AgentRoute.STRUCTURED_READ,
-            ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            f"Employee experience count by company: {text}." if data_rows else "Information not available in the current database.",
-            {"target_table": "employee_experiences", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-            _source("employee_experiences"),
-            "SELECT company_name, count(*) AS experience_count FROM employee_experiences GROUP BY company_name ORDER BY company_name",
-        )
-
-    limit = max(1, min(100, request.limit))
-    items = list(db.scalars(select(EmployeeExperience).order_by(EmployeeExperience.id).limit(limit)).all())
-    rows = _rows_from_models(items, ["id", "employee_id", "company_name", "job_title", "employment_type", "location", "start_date", "end_date", "is_current"])
-    if not rows:
-        return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.INFORMATION_NOT_AVAILABLE, "Information not available in the current database.", {"target_table": "employee_experiences", "row_count": 0, "rows": []}, _source("employee_experiences"), f"SELECT * FROM employee_experiences ORDER BY id LIMIT {limit}")
-    summaries = [f"{row.get('company_name')} - {row.get('job_title')}" for row in rows[:5]]
-    answer = f"Found {len(rows)} employee experience records. First {len(summaries)}: {_join(summaries)}."
-    return DemoQuestionResult(AgentRoute.STRUCTURED_READ, ResponseStatus.SUCCESS, answer, {"target_table": "employee_experiences", "row_count": len(rows), "rows": rows, "database_source": {"source_type": "database", "tables": ["employee_experiences"]}, "execution": {"ollama_called": False, "deterministic_demo_query": True}}, _source("employee_experiences"), f"SELECT * FROM employee_experiences ORDER BY id LIMIT {limit}")
-
-
-def _count_result(*, table: str, count: int, filters: dict[str, Any], sql: str) -> DemoQuestionResult:
-    label = table.replace("_", " ")
-    return DemoQuestionResult(
-        AgentRoute.STRUCTURED_READ,
-        ResponseStatus.SUCCESS,
-        f"There {'are' if count != 1 else 'is'} {count} {label} record{'s' if count != 1 else ''}.",
-        {"target_table": table, "row_count": count, "rows": [], "filters": filters, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-        _source(table),
-        sql,
-    )
 
 def execute_demo_question(
     db: Session,
@@ -821,21 +651,6 @@ def execute_demo_question(
                 data={"operational_tables": list(OPERATIONAL_TABLES), "table_count": len(OPERATIONAL_TABLES), "execution": {"ollama_called": False, "deterministic_demo_query": True}},
             )
 
-        if request.kind == "system_health_hint":
-            return DemoQuestionResult(
-                route=AgentRoute.SYSTEM,
-                status=ResponseStatus.SUCCESS,
-                answer=(
-                    "System health is available from the live-health endpoint and dashboard. "
-                    "It checks FastAPI, PostgreSQL, Ollama, ChromaDB, LangGraph, and MCP with bounded local probes."
-                ),
-                generated_sql=None,
-                sources=[],
-                data={"health_components": ["fastapi", "postgres", "ollama", "chromadb", "langgraph", "mcp"], "endpoint": "/api/system/live-health", "execution": {"ollama_called": False, "deterministic_demo_query": True}},
-            )
-
-        if request.table == "employee_experiences":
-            return _execute_employee_experience_query(db, request)
         if request.table == "employees":
             return _execute_employee_query(db, request, memory_context)
         if request.table == "vendors":

@@ -273,7 +273,7 @@ def live_system_health(request: Request, response: Response):
         data={
             "live": True,
             "checked_at": checked_at,
-            "poll_after_seconds": 10,
+            "poll_after_seconds": 5,
             "overall_ready": overall_ready,
             "services": services,
             "notes": [

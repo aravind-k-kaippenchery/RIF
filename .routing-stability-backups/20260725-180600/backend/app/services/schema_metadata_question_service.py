@@ -16,10 +16,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.constants import ResponseStatus, UserRole
-from app.services.schema_registry import BUSINESS_TABLES, OPERATIONAL_TABLES, get_allowed_tables, get_relationships
+from app.services.schema_registry import BUSINESS_TABLES, OPERATIONAL_TABLES, get_allowed_tables
 
 
-SchemaQuestionKind = Literal["list_tables", "table_exists", "list_columns", "column_exists", "primary_keys", "required_columns", "relationships"]
+SchemaQuestionKind = Literal["list_tables", "table_exists", "list_columns", "column_exists"]
 
 
 # Natural-language aliases are deterministic and verified against the live database.
@@ -138,8 +138,6 @@ def _extract_unknown_table_name(question: str) -> str | None:
         "new",
         "random",
         "schema",
-        "exist",
-        "exists",
     }
     for pattern in patterns:
         match = re.search(pattern, normalized)
@@ -190,41 +188,6 @@ def detect_schema_metadata_question(question: str) -> SchemaQuestionRequest:
     )
     if any(re.search(pattern, normalized) for pattern in list_table_patterns):
         return SchemaQuestionRequest(True, kind="list_tables")
-
-    relationship_patterns = (
-        r"\b(?:foreign[- ]?key|foreign keys|relationships?|relations?)\b",
-        r"\bwhich\s+tables?\s+have\s+(?:foreign[- ]?key\s+)?relationships?\b",
-    )
-    if any(re.search(pattern, normalized) for pattern in relationship_patterns):
-        return SchemaQuestionRequest(True, kind="relationships")
-
-    primary_key_patterns = (
-        r"\bprimary\s+keys?\b",
-        r"\bwhat\s+is\s+the\s+primary\s+key\b",
-    )
-    if table_mentions and any(re.search(pattern, normalized) for pattern in primary_key_patterns):
-        if len(table_mentions) > 1:
-            return SchemaQuestionRequest(True, kind="primary_keys", ambiguous_tables=table_mentions)
-        return SchemaQuestionRequest(
-            True,
-            kind="primary_keys",
-            requested_table=table_mentions[0].replace("_", " "),
-            canonical_table=table_mentions[0],
-        )
-
-    required_column_patterns = (
-        r"\b(?:required|mandatory)\s+(?:columns|fields)\b",
-        r"\b(?:columns|fields)\s+(?:are\s+)?(?:required|mandatory)\b",
-    )
-    if table_mentions and any(re.search(pattern, normalized) for pattern in required_column_patterns):
-        if len(table_mentions) > 1:
-            return SchemaQuestionRequest(True, kind="required_columns", ambiguous_tables=table_mentions)
-        return SchemaQuestionRequest(
-            True,
-            kind="required_columns",
-            requested_table=table_mentions[0].replace("_", " "),
-            canonical_table=table_mentions[0],
-        )
 
     # Table-existence questions must be resolved before the more general
     # ``have/has`` column detector. Without this precedence, a phrase such as
@@ -377,22 +340,6 @@ def answer_schema_metadata_question(
             data={"schema_metadata": {**base, "tables": visible_live_tables, "table_count": len(visible_live_tables)}},
         )
 
-    if request.kind == "relationships":
-        relationships = get_relationships()
-        if relationships:
-            readable = [
-                f"`{item.get('from_table')}.{item.get('from_column')}` → `{item.get('to_table')}.{item.get('to_column')}`"
-                for item in relationships
-            ]
-            answer = "The approved foreign-key relationships are: " + "; ".join(readable) + "."
-        else:
-            answer = "No approved foreign-key relationships were found in the controlled schema metadata."
-        return SchemaQuestionResult(
-            status=ResponseStatus.SUCCESS if relationships else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            answer=answer,
-            data={"schema_metadata": {**base, "relationships": relationships, "relationship_count": len(relationships)}},
-        )
-
     canonical = request.canonical_table
     requested = request.requested_table or canonical or "the requested table"
 
@@ -439,45 +386,6 @@ def answer_schema_metadata_question(
             code="schema_columns_unavailable",
             message=f"The columns for `{canonical}` could not be inspected right now.",
         ) from exc
-
-    if request.kind == "primary_keys":
-        try:
-            pk = inspector.get_pk_constraint(canonical, schema="public") or {}
-            pk_columns = [str(item) for item in pk.get("constrained_columns") or []]
-        except SQLAlchemyError:
-            pk_columns = []
-        answer = (
-            f"The primary key column for `{canonical}` is `{pk_columns[0]}`."
-            if len(pk_columns) == 1
-            else f"The primary key columns for `{canonical}` are: {', '.join(f'`{item}`' for item in pk_columns)}."
-            if pk_columns
-            else f"No primary key metadata was found for `{canonical}`."
-        )
-        return SchemaQuestionResult(
-            status=ResponseStatus.SUCCESS if pk_columns else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            answer=answer,
-            data={"schema_metadata": {**base, "exists": True, "table_name": canonical, "primary_key_columns": pk_columns}},
-        )
-
-    if request.kind == "required_columns":
-        live_column_details = inspector.get_columns(canonical, schema="public")
-        required = [
-            str(item.get("name"))
-            for item in live_column_details
-            if not bool(item.get("nullable"))
-            and str(item.get("name")) not in {"id", "created_at", "updated_at"}
-            and item.get("default") is None
-        ]
-        answer = (
-            f"The required non-managed columns in `{canonical}` are: {', '.join(f'`{item}`' for item in required)}."
-            if required
-            else f"No required non-managed columns were found for `{canonical}`."
-        )
-        return SchemaQuestionResult(
-            status=ResponseStatus.SUCCESS,
-            answer=answer,
-            data={"schema_metadata": {**base, "exists": True, "table_name": canonical, "required_columns": required, "columns": live_columns}},
-        )
 
     if request.kind == "list_columns":
         return SchemaQuestionResult(
