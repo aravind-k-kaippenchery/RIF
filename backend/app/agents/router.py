@@ -26,8 +26,9 @@ _WRITE_VERBS = {
     "add", "create", "insert", "generate", "seed", "populate", "make", "update", "delete", "remove", "change", "modify", "set", "rename",
 }
 _DOCUMENT_TERMS = {
-    "brochure", "document", "documents", "manual", "specification", "specifications", "warranty",
-    "policy", "pdf", "docx", "upload", "scanned", "image", "contract", "supports", "feature", "features",
+    "brochure", "document", "documents", "manual", "guide", "faq", "specification", "specifications", "warranty",
+    "policy", "pdf", "docx", "upload", "uploaded", "scanned", "image", "contract", "supports", "feature", "features",
+    "ticket", "tickets", "escalate", "escalated", "response", "refund", "support", "onboarding", "compliance", "checklist", "catalog", "summary",
 }
 _DATABASE_TERMS = {
     "employee", "employees", "worker", "workers", "vendor", "vendors", "supplier", "suppliers",
@@ -58,6 +59,7 @@ def classify_question(question: str) -> RouteDecision:
     has_document_terms = bool(tokens & _DOCUMENT_TERMS)
     has_database_terms = bool(tokens & _DATABASE_TERMS)
     has_hybrid_database_terms = bool(tokens & _HYBRID_DATABASE_TERMS)
+    is_open_question = bool(re.match(r"^(what|when|why|how|who|which|explain|summarize)\b", normalized))
 
     if has_write_verb:
         return RouteDecision(
@@ -78,6 +80,13 @@ def classify_question(question: str) -> RouteDecision:
             route=AgentRoute.DOCUMENT_RAG,
             confidence=0.88,
             reason="The question asks for product/document knowledge, so local document retrieval is the primary evidence source.",
+        )
+
+    if is_open_question and not has_database_terms:
+        return RouteDecision(
+            route=AgentRoute.DOCUMENT_RAG,
+            confidence=0.72,
+            reason="The question is read-only and does not name a database table, so uploaded documents are searched before asking for clarification.",
         )
 
     if has_database_terms:

@@ -1,4 +1,4 @@
-"""Phase 7 confirmation-gated CRUD write service.
+﻿"""Phase 7 confirmation-gated CRUD write service.
 
 The service accepts only Phase 4 validator-approved DML. It creates a preview in
 ``pending_actions`` first. Confirmation later executes exactly that stored proposal
@@ -912,6 +912,12 @@ class CrudWriteService:
         request_id: str,
     ) -> WriteConfirmationResult:
         self._require_session(db, session_id, actor_role)
+        if actor_role != UserRole.ADMIN:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="admin_role_required_for_confirmation",
+                message="Only admin users can confirm pending write actions. Normal workspace users may create previews, but cannot execute database writes.",
+            )
         action = self._load_pending_for_mutation(db, session_id=session_id, action_id=pending_action_id)
         if action.status == "confirmed":
             payload = action.validated_payload if isinstance(action.validated_payload, dict) else {}
@@ -1209,6 +1215,12 @@ class CrudWriteService:
         request_id: str,
     ) -> dict[str, Any]:
         self._require_session(db, session_id, actor_role)
+        if actor_role != UserRole.ADMIN:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="admin_role_required_for_confirmation",
+                message="Only admin users can confirm pending write actions. Normal workspace users may create previews, but cannot execute database writes.",
+            )
         action = self._load_pending_for_mutation(db, session_id=session_id, action_id=pending_action_id)
         if action.status == "confirmed":
             raise CrudWriteError(
@@ -1236,3 +1248,4 @@ class CrudWriteService:
 
 
 crud_write_service = CrudWriteService()
+

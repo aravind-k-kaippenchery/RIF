@@ -35,6 +35,7 @@ from app.services.conversation_context_service import (
     conversation_reference_from_result,
     resolve_conversation_followup,
 )
+from app.services.clarification_followup_service import rewrite_short_clarification_reply
 from app.services.session_service import create_session, get_active_session
 
 router = APIRouter(prefix="/api", tags=["Frontend-ready integration"])
@@ -91,13 +92,20 @@ def frontend_query(
     # session ID in both the JSON envelope and the response header.
     request.state.session_id = str(session.id)
     memory_context = build_memory_context(db, session_id=session.id)
-    model_memory_context = memory_context_for_question(payload.question, memory_context)
     started = perf_counter()
+
+    # Resolve short replies to our own clarification before routing. Example:
+    #   User: employees
+    #   Assistant: rows or columns?
+    #   User: read
+    # becomes: show rows from employees
+    effective_question = rewrite_short_clarification_reply(db, session_id=session.id, question=payload.question) or payload.question
+    model_memory_context = memory_context_for_question(effective_question, memory_context)
 
     # Resolve vague references deterministically before routing to Ollama/SQL.  This is
     # the guard that makes "Can I see it?" refer to the exact persisted pending or
     # confirmed action instead of allowing the model to reuse an unrelated old filter.
-    resolution = resolve_conversation_followup(db, session_id=session.id, question=payload.question)
+    resolution = resolve_conversation_followup(db, session_id=session.id, question=effective_question)
     if resolution.handled:
         resolution_data = dict(resolution.data or {})
         conversation_reference = conversation_reference_from_result(
@@ -139,7 +147,7 @@ def frontend_query(
 
     try:
         result = agent_orchestrator.run(
-            question=payload.question,
+            question=effective_question,
             db=db,
             request_id=get_request_id(request),
             session_id=str(session.id),
@@ -186,6 +194,9 @@ def frontend_query(
         conversation_reference=conversation_reference,
     )
     data = dict(result.data)
+    if effective_question != payload.question:
+        data["interpreted_question"] = effective_question
+        data["original_question"] = payload.question
     data["session"] = {
         "session_id": str(session.id),
         "created_for_request": payload.session_id is None,

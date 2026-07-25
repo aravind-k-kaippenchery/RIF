@@ -1,11 +1,11 @@
-"""Phase 7 endpoints for confirmation-gated CRUD writes."""
+﻿"""Phase 7 endpoints for confirmation-gated CRUD writes."""
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from starlette.status import HTTP_400_BAD_REQUEST, HTTP_409_CONFLICT, HTTP_503_SERVICE_UNAVAILABLE
+from starlette.status import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN, HTTP_409_CONFLICT, HTTP_503_SERVICE_UNAVAILABLE
 
 from app.core.constants import AgentRoute, ResponseStatus, UserRole
 from app.core.exceptions import AppError
@@ -22,7 +22,9 @@ router = APIRouter(prefix="/api/crud", tags=["Confirmation-gated CRUD"])
 
 def _raise_crud_error(exc: CrudWriteError) -> None:
     status_code = HTTP_400_BAD_REQUEST
-    if exc.status == ResponseStatus.DUPLICATE_DETECTED:
+    if exc.code in {"admin_role_required_for_confirmation"}:
+        status_code = HTTP_403_FORBIDDEN
+    elif exc.status == ResponseStatus.DUPLICATE_DETECTED:
         status_code = HTTP_409_CONFLICT
     elif exc.status == ResponseStatus.DATABASE_UNAVAILABLE:
         status_code = HTTP_503_SERVICE_UNAVAILABLE
@@ -216,3 +218,4 @@ def cancel_write(
         data=result,
         pending_action_id=result["pending_action"]["pending_action_id"],
     )
+

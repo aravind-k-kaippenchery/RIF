@@ -46,6 +46,12 @@ from app.services.table_record_question_service import (
     detect_table_record_question,
     read_table_records,
 )
+from app.services.demo_question_service import (
+    DemoQuestionError,
+    DemoQuestionRequest,
+    detect_demo_question,
+    execute_demo_question,
+)
 from app.services.parent_child_crud_service import (
     ParentChildError,
     looks_like_parent_child_request,
@@ -91,6 +97,7 @@ class AgentState(TypedDict, total=False):
     detected_intent: str | None
     schema_metadata_request: dict[str, Any] | None
     table_record_request: dict[str, Any] | None
+    demo_question_request: dict[str, Any] | None
     parent_child_request: bool
 
 
@@ -135,6 +142,25 @@ class AgentOrchestrator:
                     state,
                     "schema_intent_guard",
                     "Detected a table/column metadata question from the current turn; prior filters were ignored and Ollama was not called.",
+                ),
+            }
+
+        demo_request = detect_demo_question(state["question"])
+        if demo_request.handled:
+            return {
+                "route": demo_request.route.value,
+                "route_confidence": 0.99,
+                "routing_reason": (
+                    "A high-confidence demo-safe read/capability question was recognized, so the backend will answer it deterministically "
+                    "without asking Ollama to invent table names or columns."
+                ),
+                "demo_question_request": demo_request.to_state(),
+                "resolved_tables": [demo_request.table] if demo_request.table else [],
+                "detected_intent": demo_request.kind or "deterministic_demo_question",
+                "graph_trace": self._append_trace(
+                    state,
+                    "demo_question_guard",
+                    "Detected a read-only demo question and routed it to deterministic SQLAlchemy/schema handling before parent-child or LLM SQL generation.",
                 ),
             }
 
@@ -218,8 +244,10 @@ class AgentOrchestrator:
         }
 
     @staticmethod
-    def _route_selector(state: AgentState) -> Literal["schema_metadata", "clarification", "parent_child", "table_records", "structured_read", "crud_write", "document_rag", "hybrid"]:
+    def _route_selector(state: AgentState) -> Literal["schema_metadata", "demo_question", "clarification", "parent_child", "table_records", "structured_read", "crud_write", "document_rag", "hybrid"]:
         route = state.get("route", AgentRoute.STRUCTURED_READ.value)
+        if state.get("demo_question_request"):
+            return "demo_question"
         if route == AgentRoute.SYSTEM.value and state.get("schema_metadata_request"):
             return "schema_metadata"
         if route == AgentRoute.SYSTEM.value and state.get("clarification_message"):
@@ -235,6 +263,40 @@ class AgentOrchestrator:
         if route == AgentRoute.HYBRID.value:
             return "hybrid"
         return "structured_read"
+
+    def _demo_question(self, state: AgentState) -> dict[str, Any]:
+        request = DemoQuestionRequest.from_state(dict(state.get("demo_question_request") or {}))
+        try:
+            result = execute_demo_question(
+                state["db"],
+                request=request,
+                question=state["question"],
+                memory_context=state.get("memory_context"),
+            )
+        except DemoQuestionError as exc:
+            raise AgentOrchestrationError(
+                status=exc.status,
+                code=exc.code,
+                message=exc.message,
+            ) from exc
+
+        data = dict(result.data or {})
+        data["question"] = state["question"]
+        data["route_decision"] = self._route_metadata(state)
+        return {
+            "route": result.route.value,
+            "status": result.status.value,
+            "answer": result.answer,
+            "generated_sql": result.generated_sql,
+            "pending_action_id": None,
+            "sources": result.sources,
+            "data": data,
+            "graph_trace": self._append_trace(
+                state,
+                "demo_question",
+                "Answered a high-confidence demo question deterministically using schema metadata or bounded SQLAlchemy SELECT queries; no LLM SQL was generated.",
+            ),
+        }
 
     def _schema_metadata(self, state: AgentState) -> dict[str, Any]:
         from app.services.schema_metadata_question_service import SchemaQuestionRequest
@@ -769,6 +831,7 @@ class AgentOrchestrator:
         builder = StateGraph(AgentState)
         builder.add_node("router", self._classify)
         builder.add_node("schema_metadata", self._schema_metadata)
+        builder.add_node("demo_question", self._demo_question)
         builder.add_node("clarification", self._clarification)
         builder.add_node("table_records", self._table_records)
         builder.add_node("parent_child", self._parent_child)
@@ -783,6 +846,7 @@ class AgentOrchestrator:
             self._route_selector,
             {
                 "schema_metadata": "schema_metadata",
+                "demo_question": "demo_question",
                 "clarification": "clarification",
                 "table_records": "table_records",
                 "parent_child": "parent_child",
@@ -793,6 +857,7 @@ class AgentOrchestrator:
             },
         )
         builder.add_edge("schema_metadata", "finalize")
+        builder.add_edge("demo_question", "finalize")
         builder.add_edge("clarification", "finalize")
         builder.add_edge("table_records", "finalize")
         builder.add_edge("parent_child", "finalize")
@@ -867,6 +932,7 @@ class AgentOrchestrator:
             "pre_llm_ambiguity_guard_available": True,
             "deterministic_schema_question_answering_available": True,
             "deterministic_simple_table_browse_available": True,
+            "deterministic_demo_question_router_available": True,
             "semantic_parent_child_crud_available": True,
             "parent_child_supported_tables": supported_parent_child_tables(),
             "employee_experience_child_table_available": "employee_experiences" in supported_parent_child_tables(),

@@ -14,6 +14,7 @@ from app.api.routes.contracts import router as contracts_router
 from app.api.routes.crud import router as crud_router
 from app.api.routes.database import router as database_router
 from app.api.routes.documents import router as documents_router
+from app.api.routes.document_storage import router as document_storage_router
 from app.api.routes.demo import router as demo_router
 from app.api.routes.health import router as health_router
 from app.api.routes.live_health import router as live_health_router
@@ -98,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(hybrid_router)
     app.include_router(contracts_router)
     app.include_router(database_router)
+    app.include_router(document_storage_router)
     app.include_router(documents_router)
     app.include_router(demo_router)
     app.include_router(rag_router)
@@ -113,4 +115,5 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
 

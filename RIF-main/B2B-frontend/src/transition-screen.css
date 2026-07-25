@@ -1,0 +1,447 @@
+/* Premium enterprise authentication transition screen */
+
+
+.ts-root {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 60% 15%, rgba(77,163,255,.14), transparent 46%),
+    radial-gradient(circle at 18% 80%, rgba(139,123,255,.12), transparent 48%),
+    #050816;
+
+  overflow: hidden;
+  color: #f1f6ff;
+}
+
+.ts-vignette {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(800px 380px at 50% 40%, rgba(77,163,255,.10), transparent 55%),
+    radial-gradient(620px 420px at 52% 60%, rgba(139,123,255,.08), transparent 62%),
+    radial-gradient(900px 700px at 50% 50%, transparent 30%, rgba(0,0,0,.55) 100%);
+
+  opacity: 1;
+}
+
+.ts-center-wrap {
+  position: relative;
+  width: min(980px, calc(100% - 40px));
+  padding: 20px;
+  display: grid;
+  place-items: center;
+}
+
+.ts-card {
+  position: relative;
+  width: min(820px, 100%);
+  border-radius: 22px;
+  border: 1px solid rgba(77,163,255,.18);
+  background: linear-gradient(135deg, rgba(11,22,43,.76), rgba(6,10,22,.84));
+  box-shadow:
+    0 45px 150px rgba(0,0,0,.55),
+    0 0 0 1px rgba(139,123,255,.06) inset;
+  overflow: hidden;
+  transform: translateZ(0);
+}
+
+.ts-card::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  background: radial-gradient(420px 240px at 50% 42%, rgba(77,163,255,.18), transparent 60%);
+  opacity: .9;
+  pointer-events: none;
+}
+
+.ts-camera {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(900px 540px at 50% 40%, rgba(77,163,255,.09), transparent 55%),
+    linear-gradient(180deg, rgba(255,255,255,.05), transparent 30%);
+  opacity: .45;
+  pointer-events: none;
+}
+
+.ts-header {
+  position: relative;
+  z-index: 3;
+  padding: 34px 36px 6px;
+  text-align: center;
+}
+
+.ts-welcome {
+  font: 800 clamp(24px, 3.6vw, 40px)/1.06 'Space Grotesk', sans-serif;
+  letter-spacing: -0.04em;
+}
+
+.ts-init {
+  margin-top: 12px;
+  font: 700 16px/1.4 'Manrope', sans-serif;
+  letter-spacing: .02em;
+  color: #cfe4ff;
+}
+
+.ts-username {
+  background: linear-gradient(100deg, #4da3ff, #8b7bff 48%, #38d996);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.ts-core {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 520px;
+  height: 520px;
+  transform: translate(-50%, -55%);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* core power-up + completion */
+.ts-core__halo {
+  position: absolute;
+  inset: -20%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(77,163,255,.38), rgba(139,123,255,.18) 26%, rgba(56,217,150,.10) 45%, transparent 62%);
+  opacity: 0;
+  transform: scale(.75);
+  filter: blur(0.2px);
+}
+
+.ts-core--powered .ts-core__halo {
+  opacity: 1;
+  animation: tsHaloPower 1.05s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+.ts-core--complete .ts-core__halo {
+  animation: tsHaloPulse 520ms cubic-bezier(.22,1,.36,1) both;
+}
+
+@keyframes tsHaloPower {
+  0% { opacity: 0; transform: scale(.68); filter: blur(6px); }
+  55% { opacity: 1; transform: scale(1.02); filter: blur(2px); }
+  100% { opacity: 1; transform: scale(1); filter: blur(0px); }
+}
+
+@keyframes tsHaloPulse {
+  0% { transform: scale(1); filter: blur(0px); }
+  45% { transform: scale(1.08); filter: blur(1px); }
+  100% { transform: scale(1.02); filter: blur(0px); }
+}
+
+
+.ts-core__rings {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, transparent 50%, rgba(77,163,255,.12) 55%, transparent 66%),
+    radial-gradient(circle at center, transparent 28%, rgba(139,123,255,.10) 33%, transparent 45%);
+  animation: ts-coreSpin 4.5s linear infinite;
+  opacity: .85;
+}
+
+/* Power-up effect: rings brighten and expand slightly */
+.ts-core--powered .ts-core__rings {
+  animation: tsRingPower 1.05s cubic-bezier(.22, 1, .36, 1) both;
+}
+.ts-core--complete .ts-core__rings {
+  animation: tsRingPulse 520ms cubic-bezier(.22,1,.36,1) both;
+}
+
+@keyframes tsRingPower {
+  0% { opacity: 0; transform: scale(.72) rotate(0deg); filter: blur(8px); }
+  55% { opacity: .95; transform: scale(1.06) rotate(70deg); filter: blur(1px); }
+  100% { opacity: .85; transform: scale(1) rotate(120deg); filter: blur(0px); }
+}
+
+@keyframes tsRingPulse {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.09); }
+  100% { transform: scale(1.02); }
+}
+
+
+.ts-core__particles {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(77,163,255,.18), transparent 55%),
+    radial-gradient(circle at 40% 60%, rgba(139,123,255,.15), transparent 58%),
+    radial-gradient(circle at 60% 42%, rgba(56,217,150,.12), transparent 55%);
+  filter: blur(0.2px);
+}
+
+.ts-core__trails {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    conic-gradient(from 10deg, rgba(77,163,255,.0), rgba(77,163,255,.22), rgba(139,123,255,.18), rgba(56,217,150,.14), rgba(77,163,255,.0));
+  mask-image: radial-gradient(circle at center, transparent 40%, black 60%);
+  animation: ts-trails 1.8s ease-in-out infinite;
+  opacity: .8;
+}
+
+.ts-core__packets {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(77,163,255,.0) 0 33%, rgba(77,163,255,.22) 34% 35%, rgba(77,163,255,.0) 36%);
+  animation: ts-packets 1.35s ease-in-out infinite;
+  opacity: .9;
+}
+
+/* Outer energy wave on completion */
+.ts-core--complete .ts-core__packets {
+  animation: tsWaveBurst 620ms cubic-bezier(.22,1,.36,1) both;
+}
+
+@keyframes tsWaveBurst {
+  0% { transform: scale(1); filter: blur(0px); opacity: .35; }
+  45% { transform: scale(1.08); filter: blur(0.6px); opacity: 1; }
+  100% { transform: scale(1.02); filter: blur(0px); opacity: .9; }
+}
+
+@keyframes ts-coreSpin {
+
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes ts-trails {
+  0%, 100% { transform: scale(1) rotate(-6deg); filter: blur(0px); opacity: .7; }
+  50% { transform: scale(1.02) rotate(8deg); filter: blur(.3px); opacity: .95; }
+}
+
+@keyframes ts-packets {
+  0%, 100% { transform: rotate(0deg) scale(1); opacity: .65; }
+  50% { transform: rotate(18deg) scale(1.03); opacity: 1; }
+}
+
+.ts-status {
+  position: relative;
+  z-index: 4;
+  padding: 10px 36px 22px;
+}
+
+.ts-status-row {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 10px;
+  align-items: center;
+  margin: 9px auto;
+  width: min(620px, 100%);
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(148,163,184,.10);
+  background: rgba(255,255,255,.015);
+  transform: translateY(10px);
+  opacity: 0;
+}
+
+.ts-status-row {
+  animation: tsRowIn .52s cubic-bezier(.22, 1, .36, 1) both;
+  animation-delay: 0ms;
+}
+
+
+@keyframes tsRowIn {
+  from { opacity: 0; transform: translateY(12px) scale(.99); }
+  to { opacity: 1; transform: translateY(0px) scale(1); }
+}
+
+.ts-status-row.pending {
+  border-color: rgba(148,163,184,.10);
+  color: #a7c1dc;
+}
+
+.ts-status-row.active {
+  border-color: rgba(77,163,255,.38);
+  background: linear-gradient(135deg, rgba(77,163,255,.14), rgba(139,123,255,.06));
+  box-shadow: 0 0 0 3px rgba(77,163,255,.06);
+  color: #d5ebff;
+}
+
+.ts-status-row.done {
+  border-color: rgba(56,217,150,.26);
+  background: linear-gradient(135deg, rgba(56,217,150,.10), rgba(77,163,255,.05));
+  color: #d7ffe9;
+}
+
+.ts-check {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: rgba(77,163,255,.9);
+  filter: drop-shadow(0 0 10px rgba(77,163,255,.35));
+}
+
+.ts-status-row.active .ts-check {
+  color: rgba(77,163,255,1);
+  filter: drop-shadow(0 0 14px rgba(77,163,255,.55));
+}
+
+.ts-status-row.done .ts-check {
+  color: rgba(56,217,150,1);
+  filter: drop-shadow(0 0 16px rgba(56,217,150,.45));
+}
+
+.ts-status-text {
+  font: 800 13px/1.2 'JetBrains Mono', monospace;
+  letter-spacing: .01em;
+}
+
+.ts-status-micro {
+  display: none;
+}
+
+.ts-progress {
+  position: relative;
+  width: min(620px, 100%);
+  margin: 18px auto 0;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(77,163,255,.18);
+  background: rgba(255,255,255,.02);
+  overflow: hidden;
+}
+
+.ts-progress__bar {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(77,163,255,.0), rgba(77,163,255,.6), rgba(139,123,255,.35));
+  border-radius: 999px;
+  box-shadow: 0 0 16px rgba(77,163,255,.25);
+  transition: width .22s ease;
+}
+
+.ts-footer {
+  position: relative;
+  z-index: 4;
+  display: flex;
+  gap: 14px;
+  justify-content: center;
+  flex-wrap: wrap;
+  padding: 0 18px 28px;
+  color: rgba(170,196,225,.95);
+}
+
+.ts-footer-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148,163,184,.10);
+  background: rgba(255,255,255,.016);
+  font: 800 10px/1.2 'JetBrains Mono', monospace;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.ts-hint {
+  margin-top: 18px;
+  color: rgba(150,190,240,.9);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(148,163,184,.10);
+  background: rgba(255,255,255,.012);
+  font: 800 10px/1.2 'JetBrains Mono', monospace;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  opacity: .9;
+  animation: tsHintFloat 2.3s ease-in-out infinite;
+  z-index: 5;
+}
+
+@keyframes tsHintFloat {
+  0%, 100% { transform: translateY(0px); opacity: .86; }
+  50% { transform: translateY(-7px); opacity: 1; }
+}
+
+/* micro activation blocks (enterprise-themed) */
+.ts-micro-activations {
+  position: absolute;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 5;
+  width: min(820px, 100%);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 0 26px;
+}
+
+.ts-micro {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(148,163,184,.10);
+  background: rgba(255,255,255,.016);
+  opacity: .55;
+  transform: translateY(10px);
+}
+
+.ts-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(77,163,255,.8);
+  box-shadow: 0 0 18px rgba(77,163,255,.4);
+}
+
+.ts-micro--chromadb .ts-dot { background: rgba(77,163,255,.9); box-shadow: 0 0 18px rgba(77,163,255,.45); }
+.ts-micro--langgraph .ts-dot { background: rgba(139,123,255,.9); box-shadow: 0 0 18px rgba(139,123,255,.38); }
+.ts-micro--mcp .ts-dot { background: rgba(56,217,150,.85); box-shadow: 0 0 18px rgba(56,217,150,.35); }
+.ts-micro--indexing .ts-dot { background: rgba(77,163,255,.9); box-shadow: 0 0 18px rgba(77,163,255,.38); }
+.ts-micro--dbsync .ts-dot { background: rgba(139,123,255,.9); box-shadow: 0 0 18px rgba(139,123,255,.35); }
+
+.ts-root.enter {
+  animation: tsEnter .22s ease both;
+}
+
+@keyframes tsEnter {
+  from { opacity: 0; transform: scale(1.02); filter: blur(10px); }
+  to { opacity: 1; transform: scale(1); filter: blur(0px); }
+}
+
+.ts-root.running {
+  animation: none;
+}
+
+.ts-root.exit {
+  animation: tsExit 420ms cubic-bezier(.22, 1, .36, 1) both;
+}
+
+@keyframes tsExit {
+  from { opacity: 1; transform: scale(1) translateZ(0); }
+  to { opacity: 0; transform: scale(1.06) translateY(-8px); filter: blur(12px); }
+}
+
+/* Accessibility */
+@media (prefers-reduced-motion: reduce) {
+  .ts-core__rings,
+  .ts-core__trails,
+  .ts-core__particles,
+  .ts-core__packets,
+  .ts-hint {
+    animation: none !important;
+  }
+  .ts-status-row { animation: none !important; opacity: 1 !important; transform: none !important; }
+}
+
+

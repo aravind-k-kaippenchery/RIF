@@ -45,6 +45,11 @@ _READ_VERBS = {
     "which",
     "what",
     "who",
+    "when",
+    "why",
+    "how",
+    "explain",
+    "summarize",
 }
 _GENERATION_SIGNALS = {
     "random",
@@ -75,6 +80,20 @@ _DOCUMENT_TERMS = {
     "scanned",
     "image",
     "contract",
+    "guide",
+    "faq",
+    "uploaded",
+    "ticket",
+    "tickets",
+    "escalate",
+    "escalated",
+    "response",
+    "refund",
+    "support",
+    "onboarding",
+    "compliance",
+    "catalog",
+    "summary",
 }
 _REFERENCE_TERMS = {"it", "them", "those", "that", "one", "ones", "previous", "last", "new"}
 _GENERIC_DATA_TERMS = {"data", "record", "records", "row", "rows", "table", "tables", "entry", "entries"}
@@ -391,7 +410,7 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
     if resolved_tables:
         return ClarificationDecision(False, resolved_tables=resolved_tables, detected_intent="structured_read")
 
-    if tokens & _REFERENCE_TERMS or has_read or tokens & _GENERIC_DATA_TERMS:
+    if tokens & _GENERIC_DATA_TERMS or tokens & _REFERENCE_TERMS:
         return ClarificationDecision(
             True,
             code="read_target_required",
@@ -401,6 +420,13 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
             ),
             missing_fields=("target_table_or_context",),
             detected_intent="structured_read",
+        )
+
+    if has_read:
+        return ClarificationDecision(
+            False,
+            resolved_tables=resolved_tables,
+            detected_intent="document_question",
         )
 
     return ClarificationDecision(
