@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 import json
 import re
 from typing import Any, Iterable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 from sqlalchemy import Boolean, Date, DateTime, Integer, Numeric, String, Text, and_, func, select
@@ -218,12 +218,31 @@ def looks_like_parent_child_request(question: str) -> bool:
         "product vendor mapping",
         "vendor mapping",
         "supplier mapping",
+        "products and their vendors",
+        "product and vendor",
+        "product vendors",
+        "product suppliers",
+        "vendors for product",
+        "vendors linked to product",
+        "suppliers for product",
         "link product",
         "link vendor",
         "map product",
         "map vendor",
+        "supplier for product",
+        "vendors linked to product",
+        "vendors for product",
+        "products and their vendors",
+        "products with vendors",
+        "product suppliers",
     )
     if any(phrase in normalized for phrase in strong_phrases):
+        return True
+    if (
+        re.search(r"\bproducts?\b", normalized)
+        and re.search(r"\b(?:vendors?|suppliers?)\b", normalized)
+        and re.search(r"\b(?:show|list|display|view|see|link|map|add|create|assign)\b", normalized)
+    ):
         return True
     code_count = len(re.findall(r"\b(?:EMP|PRD|PROD|VND|VEN|CUST|CUS)-[A-Z0-9-]+\b", question, flags=re.IGNORECASE))
     if code_count >= 2 and re.search(r"\b(?:deal|opportunity|link|mapping|map|assign|relate)\b", normalized):
@@ -241,8 +260,100 @@ def looks_like_parent_child_request(question: str) -> bool:
 
 
 
-_EMPLOYEE_CODE_PATTERN = re.compile(r"\bEMP-[A-Z0-9-]+\b", flags=re.IGNORECASE)
+# Accept common employee-code spelling used in demos: EMP-105 and EMP 105.
+# The pattern intentionally requires a separator after EMP so it does not match the
+# word "employee".
+_EMPLOYEE_CODE_PATTERN = re.compile(r"\bEMP(?:[-\s]+\d{1,10}|-[A-Z0-9][A-Z0-9-]*)\b", flags=re.IGNORECASE)
+_EMPLOYEE_ID_PATTERN = re.compile(r"\bemployee\s+id\s+(?P<id>\d{1,10})\b", flags=re.IGNORECASE)
+_PRODUCT_CODE_PATTERN = re.compile(r"\b(?:PRD|PROD)[-\s]+[A-Z0-9-]+\b", flags=re.IGNORECASE)
+_VENDOR_CODE_PATTERN = re.compile(r"\b(?:VND|VEN)[-\s]+[A-Z0-9-]+\b", flags=re.IGNORECASE)
+_PRODUCT_ID_PATTERN = re.compile(r"\bproduct\s+id\s+(?P<id>\d{1,10})\b", flags=re.IGNORECASE)
+_VENDOR_ID_PATTERN = re.compile(r"\bvendor\s+id\s+(?P<id>\d{1,10})\b", flags=re.IGNORECASE)
 _ISO_DATE_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _normalize_employee_code(value: str) -> str:
+    cleaned = re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+    if cleaned.startswith("EMP") and len(cleaned) > 3:
+        return f"EMP-{cleaned[3:]}"
+    return str(value or "").upper()
+
+
+def _canonical_business_code(raw: str) -> str:
+    value = " ".join(str(raw or "").strip().upper().split())
+    value = value.replace(" ", "-")
+    if value.startswith("PROD-"):
+        return "PRD-" + value.removeprefix("PROD-")
+    if value.startswith("VEN-"):
+        return "VND-" + value.removeprefix("VEN-")
+    return value
+
+
+def _employee_reference_from_text(text: str) -> ParentReference | None:
+    id_match = _EMPLOYEE_ID_PATTERN.search(text)
+    if id_match:
+        return ParentReference(role="employee", id=int(id_match.group("id")))
+    code_match = _EMPLOYEE_CODE_PATTERN.search(text)
+    if code_match:
+        return ParentReference(role="employee", code=_canonical_business_code(code_match.group(0)))
+    return None
+
+
+def _product_reference_from_text(text: str) -> ParentReference | None:
+    id_match = _PRODUCT_ID_PATTERN.search(text)
+    if id_match:
+        return ParentReference(role="product", id=int(id_match.group("id")))
+    code_match = _PRODUCT_CODE_PATTERN.search(text)
+    if code_match:
+        return ParentReference(role="product", code=_canonical_business_code(code_match.group(0)))
+    return None
+
+
+def _vendor_reference_from_text(text: str) -> ParentReference | None:
+    id_match = _VENDOR_ID_PATTERN.search(text)
+    if id_match:
+        return ParentReference(role="vendor", id=int(id_match.group("id")))
+    code_match = _VENDOR_CODE_PATTERN.search(text)
+    if code_match:
+        return ParentReference(role="vendor", code=_canonical_business_code(code_match.group(0)))
+    return None
+
+
+def _display_parent_reference(reference: ParentReference | None, fallback: str = "record") -> str:
+    if reference is None:
+        return fallback
+    if reference.code:
+        return reference.code
+    if reference.id is not None:
+        return f"{fallback} ID {reference.id}"
+    return fallback
+
+
+def _subtract_years(value: date, years: int) -> date:
+    try:
+        return value.replace(year=value.year - years)
+    except ValueError:
+        # Handles leap-day dates.
+        return value.replace(month=2, day=28, year=value.year - years)
+
+
+def _subtract_months(value: date, months: int) -> date:
+    total_months = value.year * 12 + value.month - 1 - months
+    year = total_months // 12
+    month = total_months % 12 + 1
+    day = min(value.day, 28)
+    return value.replace(year=year, month=month, day=day)
+
+
+def _date_range_from_duration(text: str) -> tuple[str | None, str | None]:
+    match = re.search(r"\bfor\s+(?P<count>\d{1,2})\s+(?P<unit>years?|months?)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None, None
+    count = int(match.group("count"))
+    unit = match.group("unit").casefold()
+    end = date.today()
+    start = _subtract_years(end, count) if unit.startswith("year") else _subtract_months(end, count)
+    return start.isoformat(), end.isoformat()
 
 
 def _clean_extracted_text(value: str | None) -> str | None:
@@ -294,22 +405,27 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
     if not original or not (experience_signal or employee_role_change_signal):
         return None
 
-    employee_match = _EMPLOYEE_CODE_PATTERN.search(original)
-    employee_code = employee_match.group(0).upper() if employee_match else None
+    employee_reference = _employee_reference_from_text(original)
+    employee_label = _display_parent_reference(employee_reference, "employee")
     write_create = bool(re.search(r"\b(?:add|create|insert|record)\b", normalized))
     write_update = bool(re.search(r"\b(?:change|update|modify|set|rename)\b", normalized))
     write_delete = bool(re.search(r"\b(?:delete|remove)\b", normalized))
     read_request = bool(re.search(r"\b(?:show|list|display|view|see|get|find|what)\b", normalized))
 
-    if not employee_code:
+    if not employee_reference:
         return ParentChildIntentPlan(
             operation="clarify",
             confidence=1.0,
-            clarification_question="Which employee should I use? Please provide the employee code, such as EMP-105.",
-            interpretation="Employee experience request is missing the parent employee code.",
+            clarification_question=(
+                "This is a child-record request, so I need an existing parent employee. "
+                "Please provide an employee code such as EMP-105 or say employee ID 1. "
+                "To create a brand-new employee and then add experience, first create the employee, confirm it, "
+                "then add the experience using the created employee code."
+            ),
+            interpretation="Employee experience request is missing the parent employee code or ID.",
         )
 
-    parent = [ParentReference(role="employee", code=employee_code)]
+    parent = [employee_reference]
 
     if write_create:
         # Preferred order: at COMPANY as TITLE from START to END.
@@ -345,7 +461,7 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
                 flags=re.IGNORECASE,
             )
             title_match = re.search(
-                r"\bas\s+(?P<title>.+?)(?=\s+at\s+|\s+(?:from|between|since|starting)\s+|$)",
+                r"\bas\s+(?P<title>.+?)(?=\s+at\s+|\s+(?:from|between|since|starting)\s+|\s+for\s+\d{1,2}\s+(?:years?|months?)\b|$)",
                 original,
                 flags=re.IGNORECASE,
             )
@@ -354,6 +470,10 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
             dates = _ISO_DATE_PATTERN.findall(original)
             start_date = dates[0] if dates else None
             end_date = dates[1] if len(dates) > 1 else None
+            if start_date is None:
+                duration_start, duration_end = _date_range_from_duration(original)
+                start_date = duration_start
+                end_date = duration_end
 
         missing: list[str] = []
         if not company:
@@ -369,7 +489,7 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
                 parent_references=parent,
                 confidence=1.0,
                 clarification_question=(
-                    f"Please provide the {', '.join(missing)} for {employee_code}. "
+                    f"Please provide the {', '.join(missing)} for {employee_label}. "
                     "For example: at Infosys as Python Developer from 2021-01-01 to 2024-01-01."
                 ),
                 interpretation="Employee experience create request is missing required values.",
@@ -430,7 +550,7 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
             parent_references=parent,
             confidence=1.0,
             clarification_question=(
-                f"Which {employee_code} experience should I update, which field should change, and what is the new value?"
+                f"Which {employee_label} experience should I update, which field should change, and what is the new value?"
             ),
             interpretation="Employee experience update request is missing an exact child selector or new value.",
         )
@@ -459,7 +579,7 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
                 parent_references=parent,
                 confidence=1.0,
                 clarification_question=(
-                    f"Which {employee_code} experience should I delete? State the company, or say oldest/latest."
+                    f"Which {employee_label} experience should I delete? State the company, or say oldest/latest."
                 ),
                 interpretation="Employee experience delete request is missing an exact child selector.",
             )
@@ -484,6 +604,261 @@ def _parse_clear_employee_experience_request(question: str) -> ParentChildIntent
 
     return None
 
+
+def _parse_product_vendor_request(question: str) -> ParentChildIntentPlan | None:
+    """Parse common product/vendor relationship prompts deterministically.
+
+    This keeps demo prompts such as "Show products and their vendors" from being
+    misread as a plain vendor-table browse. It also supports clear create prompts with
+    product/vendor IDs or business codes and a quoted price.
+    """
+
+    original = " ".join(str(question or "").strip().split())
+    normalized = original.casefold()
+    if not original:
+        return None
+    has_product = bool(re.search(r"\bproducts?\b", normalized) or _PRODUCT_CODE_PATTERN.search(original) or _PRODUCT_ID_PATTERN.search(original))
+    has_vendor = bool(re.search(r"\b(?:vendors?|suppliers?)\b", normalized) or _VENDOR_CODE_PATTERN.search(original) or _VENDOR_ID_PATTERN.search(original))
+    if not (has_product and has_vendor):
+        return None
+
+    product_ref = _product_reference_from_text(original)
+    vendor_ref = _vendor_reference_from_text(original)
+    parents = [ref for ref in (product_ref, vendor_ref) if ref is not None]
+
+    is_write = bool(re.search(r"\b(?:add|create|insert|link|map|assign|connect)\b", normalized))
+    is_delete = bool(re.search(r"\b(?:delete|remove|unlink|detach)\b", normalized))
+    is_update = bool(re.search(r"\b(?:update|change|modify|set)\b", normalized))
+    is_read = bool(re.search(r"\b(?:show|list|display|view|see|get|find|what|which)\b", normalized))
+
+    if is_write and not (is_update or is_delete):
+        missing: list[str] = []
+        if product_ref is None:
+            missing.append("product ID or product code")
+        if vendor_ref is None:
+            missing.append("vendor ID or vendor code")
+        price_match = re.search(r"\b(?:quoted\s+price|quote|price)\s*(?:is|=|to|of|:)??\s*(?P<price>\d+(?:\.\d+)?)\b", normalized)
+        if not price_match:
+            missing.append("quoted price")
+        if missing:
+            return ParentChildIntentPlan(
+                operation="clarify",
+                child_table="product_vendor_mappings",
+                parent_references=parents,
+                confidence=1.0,
+                clarification_question=(
+                    "Please provide the " + ", ".join(missing) +
+                    ". Example: Add vendor ID 1 as a supplier for product ID 1 with quoted price 450000."
+                ),
+                interpretation="Product-vendor mapping create request is missing required values.",
+            )
+        values: dict[str, Any] = {"quoted_price": price_match.group("price")}
+        sku_match = re.search(r"\bsku\s*(?:is|=|to|:)??\s*(?P<sku>[A-Z0-9._-]{2,80})\b", original, flags=re.IGNORECASE)
+        if sku_match:
+            values["vendor_sku"] = sku_match.group("sku")
+        if re.search(r"\bpreferred\b", normalized):
+            values["is_preferred"] = True
+        return ParentChildIntentPlan(
+            operation="create",
+            child_table="product_vendor_mappings",
+            parent_references=parents,
+            values=values,
+            confidence=1.0,
+            interpretation="Deterministically parsed a product-vendor mapping creation request.",
+        )
+
+    if is_update:
+        if not parents:
+            return ParentChildIntentPlan(
+                operation="clarify",
+                child_table="product_vendor_mappings",
+                confidence=1.0,
+                clarification_question="Which product-vendor mapping should I update? Provide a product/vendor ID or business code.",
+                interpretation="Product-vendor mapping update request is missing selectors.",
+            )
+        price_match = re.search(r"\b(?:quoted\s+price|quote|price)\s*(?:is|=|to|of|:)??\s*(?P<price>\d+(?:\.\d+)?)\b", normalized)
+        values = {"quoted_price": price_match.group("price")} if price_match else {}
+        if re.search(r"\bpreferred\b", normalized):
+            values["is_preferred"] = True
+        if not values:
+            return ParentChildIntentPlan(
+                operation="clarify",
+                child_table="product_vendor_mappings",
+                parent_references=parents,
+                confidence=1.0,
+                clarification_question="Which mapping field should change? For example, set quoted price to 450000.",
+                interpretation="Product-vendor mapping update request is missing change values.",
+            )
+        return ParentChildIntentPlan(
+            operation="update",
+            child_table="product_vendor_mappings",
+            parent_references=parents,
+            values=values,
+            confidence=1.0,
+            interpretation="Deterministically parsed a product-vendor mapping update request.",
+        )
+
+    if is_delete:
+        if not parents:
+            return ParentChildIntentPlan(
+                operation="clarify",
+                child_table="product_vendor_mappings",
+                confidence=1.0,
+                clarification_question="Which product-vendor mapping should I delete? Provide a product/vendor ID or business code.",
+                interpretation="Product-vendor mapping delete request is missing selectors.",
+            )
+        return ParentChildIntentPlan(
+            operation="delete",
+            child_table="product_vendor_mappings",
+            parent_references=parents,
+            confidence=1.0,
+            interpretation="Deterministically parsed a product-vendor mapping delete request.",
+        )
+
+    if is_read or re.search(r"\bproducts?\s+and\s+(?:their\s+)?(?:vendors?|suppliers?)\b", normalized):
+        return ParentChildIntentPlan(
+            operation="read",
+            child_table="product_vendor_mappings",
+            parent_references=parents,
+            confidence=1.0,
+            interpretation="Deterministically parsed a product-vendor relationship read request.",
+        )
+
+    return None
+
+
+def _parse_new_employee_with_deferred_experience(question: str) -> dict[str, Any] | None:
+    """Extract a safe parent-first create preview from a combined parent+child prompt.
+
+    The current confirmation engine stores one target table per pending action. A prompt
+    that creates a brand-new employee and a child experience therefore has to be staged:
+    first create the employee parent, then add the experience using the confirmed
+    employee code. This parser prepares the parent insert and records the suggested
+    next child prompt in metadata.
+    """
+
+    original = " ".join(str(question or "").strip().split())
+    normalized = original.casefold()
+    if not original:
+        return None
+    if not (re.search(r"\b(?:create|add|insert)\s+(?:an?\s+)?employee\s+named\b", normalized) and re.search(r"\bexperience\b", normalized)):
+        return None
+    name_match = re.search(r"\bemployee\s+named\s+(?P<name>[A-Z][A-Za-z .'-]{2,80}?)(?=\s+with\s+email|\s+email|,|\s+department|$)", original)
+    email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", original, flags=re.IGNORECASE)
+    dept_match = re.search(r"\bdepartment\s+(?P<dept>[A-Za-z][A-Za-z &-]{1,50})(?=,|\s+city|\s+and|$)", original, flags=re.IGNORECASE)
+    city_match = re.search(r"\bcity\s+(?P<city>[A-Za-z][A-Za-z -]{1,50})(?=,|\s+active|\s+inactive|\s+and|$)", original, flags=re.IGNORECASE)
+    if not (name_match and email_match and dept_match and city_match):
+        return None
+    name_parts = [part for part in name_match.group("name").strip().split() if part]
+    if not name_parts:
+        return None
+    first_name = name_parts[0]
+    last_name = " ".join(name_parts[1:]) or "Demo"
+    employee_code = f"EMP-DEMO-{uuid4().hex[:8].upper()}"
+    record = {
+        "employee_code": employee_code,
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": email_match.group(0),
+        "department": dept_match.group("dept").strip().title(),
+        "city": city_match.group("city").strip().title(),
+        "company_name": "RIF Demo",
+        "salary": "50000.00",
+        "employment_status": "inactive" if re.search(r"\binactive\b", normalized) else "active",
+    }
+
+    company_match = re.search(r"\bat\s+(?P<company>.+?)(?=\s+as\s+|\s+(?:from|between|since|starting|for\s+\d+)\s+|$)", original, flags=re.IGNORECASE)
+    title_match = re.search(r"\bas\s+(?P<title>.+?)(?=\s+at\s+|\s+(?:from|between|since|starting|for\s+\d+\s+(?:years?|months?))\b|$)", original, flags=re.IGNORECASE)
+    company = _clean_extracted_text(company_match.group("company")) if company_match else None
+    title = _clean_extracted_text(title_match.group("title")) if title_match else None
+    dates = _ISO_DATE_PATTERN.findall(original)
+    start_date = dates[0] if dates else None
+    end_date = dates[1] if len(dates) > 1 else None
+    if start_date is None:
+        start_date, end_date = _date_range_from_duration(original)
+    duration_match = re.search(r"\bfor\s+\d{1,2}\s+(?:years?|months?)\b", original, flags=re.IGNORECASE)
+    if start_date:
+        date_text = f"from {start_date}" + (f" to {end_date}" if end_date else "")
+    elif duration_match:
+        date_text = duration_match.group(0)
+    else:
+        date_text = "from YYYY-MM-DD to YYYY-MM-DD"
+    next_prompt = None
+    if company and title:
+        next_prompt = f"Add experience for {employee_code} at {company} as {title} {date_text}."
+
+    return {
+        "target_table": "employees",
+        "record": record,
+        "deferred_child": {
+            "child_table": "employee_experiences",
+            "company_name": company,
+            "job_title": title,
+            "start_date": start_date,
+            "end_date": end_date,
+            "next_prompt": next_prompt,
+        },
+    }
+
+
+
+def _parse_clear_product_vendor_request(question: str) -> ParentChildIntentPlan | None:
+    """Deterministically parse common product-vendor relationship demo prompts."""
+
+    original = " ".join(str(question or "").strip().split())
+    normalized = original.casefold()
+    if not original:
+        return None
+    has_product = re.search(r"\bproducts?\b", normalized) is not None
+    has_vendor = re.search(r"\b(?:vendors?|suppliers?)\b", normalized) is not None
+    if not (has_product and has_vendor):
+        return None
+
+    read_signal = re.search(r"\b(?:show|list|display|view|see|get|find|which)\b", normalized) is not None
+    create_signal = re.search(r"\b(?:add|create|link|map|assign)\b", normalized) is not None
+
+    def parent_id(role: str) -> int | None:
+        match = re.search(rf"\b{role}\s+id\s+(\d+)\b", normalized)
+        return int(match.group(1)) if match else None
+
+    product_id = parent_id("product")
+    vendor_id = parent_id("vendor") or parent_id("supplier")
+    references: list[ParentReference] = []
+    if product_id is not None:
+        references.append(ParentReference(role="product", id=product_id))
+    if vendor_id is not None:
+        references.append(ParentReference(role="vendor", id=vendor_id))
+
+    if create_signal:
+        price_match = re.search(r"\b(?:quoted\s+price|price|quote)\s+(?:is\s+|as\s+|=\s*)?(\d+(?:\.\d+)?)\b", normalized)
+        if product_id is None or vendor_id is None or not price_match:
+            return ParentChildIntentPlan(
+                operation="clarify",
+                child_table="product_vendor_mappings",
+                parent_references=references,
+                confidence=1.0,
+                clarification_question="Please provide product ID, vendor ID, and quoted price. Example: Add vendor ID 1 as a supplier for product ID 1 with quoted price 450000.",
+                interpretation="Product-vendor mapping create request is missing a required value.",
+            )
+        return ParentChildIntentPlan(
+            operation="create",
+            child_table="product_vendor_mappings",
+            parent_references=references,
+            values={"quoted_price": price_match.group(1)},
+            confidence=1.0,
+            interpretation="Deterministically parsed product-vendor mapping creation.",
+        )
+
+    if read_signal or re.search(r"\b(?:their|linked|mapping|mappings|suppliers?)\b", normalized):
+        return ParentChildIntentPlan(
+            operation="read",
+            child_table="product_vendor_mappings",
+            parent_references=references,
+            confidence=1.0,
+            interpretation="Deterministically parsed product-vendor relationship read.",
+        )
+
+    return None
 
 def _contract_for_prompt() -> dict[str, Any]:
     contract: dict[str, Any] = {}
@@ -614,11 +989,15 @@ class ParentChildCrudService:
         memory_context: dict[str, Any] | None = None,
     ) -> tuple[ParentChildIntentPlan, dict[str, Any]]:
         deterministic_plan = _parse_clear_employee_experience_request(question)
+        deterministic_source = "deterministic_employee_experience_parser"
+        if deterministic_plan is None:
+            deterministic_plan = _parse_product_vendor_request(question)
+            deterministic_source = "deterministic_product_vendor_parser"
         if deterministic_plan is not None:
             return deterministic_plan, {
                 "model": "deterministic_parent_child_parser",
                 "attempts": 0,
-                "source": "deterministic_employee_experience_parser",
+                "source": deterministic_source,
                 "ollama_called": False,
             }
 
@@ -688,7 +1067,10 @@ class ParentChildCrudService:
                     message=f"Please provide only one {role.replace('_', ' ')} reference.",
                 )
             seen.add(role)
-            normalized.append(reference.model_copy(update={"role": role}))
+            update_values = {"role": role}
+            if role == "employee" and reference.code:
+                update_values["code"] = _normalize_employee_code(reference.code)
+            normalized.append(reference.model_copy(update=update_values))
         return normalized
 
     @staticmethod
@@ -954,6 +1336,61 @@ class ParentChildCrudService:
         actor_role: UserRole,
         memory_context: dict[str, Any] | None = None,
     ) -> ParentChildResult:
+        staged_parent = _parse_new_employee_with_deferred_experience(question)
+        if staged_parent is not None:
+            record = dict(staged_parent["record"])
+            deferred_child = dict(staged_parent.get("deferred_child") or {})
+            try:
+                proposal = crud_write_service.propose_bulk_insert(
+                    db,
+                    session_id=session_id,
+                    target_table="employees",
+                    records=[record],
+                    actor_role=actor_role,
+                    user_prompt=question,
+                    generation_metadata={
+                        "requested_record_count": 1,
+                        "generated_record_count": 1,
+                        "source": "staged_parent_child_employee_parser",
+                        "staged_parent_child": True,
+                        "deferred_child": deferred_child,
+                    },
+                )
+            except CrudWriteError as exc:
+                raise ParentChildError(status=exc.status, code=exc.code, message=exc.message, details=exc.details) from exc
+            next_prompt = deferred_child.get("next_prompt")
+            answer = (
+                "Prepared the parent employee record first. The current safe confirmation engine stores one target table per pending action, "
+                "so no child experience was inserted yet. Confirm this employee insert, then add the experience as a second confirmation-gated action"
+                + (f": {next_prompt}" if next_prompt else ".")
+            )
+            return ParentChildResult(
+                route=AgentRoute.CRUD_WRITE,
+                status=ResponseStatus.PENDING_CONFIRMATION,
+                answer=answer,
+                pending_action_id=proposal.pending_action["pending_action_id"],
+                data={
+                    "target_table": "employees",
+                    "pending_action": proposal.pending_action,
+                    "preview": proposal.preview,
+                    "rows": proposal.preview.get("records", []),
+                    "relationship_intent": {
+                        "operation": "staged_parent_create",
+                        "parent_table": "employees",
+                        "child_table": "employee_experiences",
+                        "deferred_child": deferred_child,
+                    },
+                    "model_metadata": {
+                        "model": "deterministic_parent_child_parser",
+                        "attempts": 0,
+                        "source": "staged_parent_child_employee_parser",
+                        "ollama_called": False,
+                    },
+                    "write_execution_allowed": False,
+                    "next_step": next_prompt or "Confirm the employee insert, then add the experience using the created employee code.",
+                },
+            )
+
         try:
             plan, model_metadata = self._generate_plan(question, memory_context=memory_context)
         except LLMOutputValidationError as exc:
@@ -982,11 +1419,14 @@ class ParentChildCrudService:
             rows = self._matching_rows(db, plan, definition, resolved_parents)
             rows = self._enrich_parent_codes(db, definition, rows)
             status = ResponseStatus.SUCCESS if rows else ResponseStatus.INFORMATION_NOT_AVAILABLE
-            answer = (
-                f"Found {len(rows)} {definition.readable_name} record{'s' if len(rows) != 1 else ''}."
-                if rows
-                else f"No matching {definition.readable_name} records were found."
-            )
+            if rows and definition.child_table == "product_vendor_mappings":
+                answer = f"Found {len(rows)} product-vendor mapping record{'s' if len(rows) != 1 else ''} linking products to vendors."
+            else:
+                answer = (
+                    f"Found {len(rows)} {definition.readable_name} record{'s' if len(rows) != 1 else ''}."
+                    if rows
+                    else f"No matching {definition.readable_name} records were found."
+                )
             return ParentChildResult(
                 route=AgentRoute.STRUCTURED_READ,
                 status=status,

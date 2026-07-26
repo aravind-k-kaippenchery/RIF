@@ -485,10 +485,10 @@ class StructuredReadService:
                 applied_limit=tool_validation_payload.get("applied_limit"),
             )
 
-        row_count = int(tool_result.get("row_count", len(rows)))
-
-        if row_count != len(rows):
-            row_count = len(rows)
+        returned_row_count = int(tool_result.get("returned_row_count", len(rows)) or len(rows))
+        row_count = int(tool_result.get("total_row_count") or tool_result.get("row_count") or len(rows))
+        if row_count < returned_row_count:
+            row_count = returned_row_count
 
         normalized_source_tables = [str(table) for table in source_tables]
 

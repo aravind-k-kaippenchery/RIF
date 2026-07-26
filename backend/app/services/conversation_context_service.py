@@ -42,6 +42,8 @@ _FAILURE_STATUSES = {
 }
 
 _SHOW_REFERENCE_PATTERNS = (
+    re.compile(r"^(?:show|display|view|list)\s+(?:me\s+)?(?:the\s+)?(?:pending\s+action|latest\s+pending\s+action|current\s+pending\s+action|pending\s+preview|generated\s+preview|preview)[?.!]*$", re.I),
+    re.compile(r"^(?:what\s+record\s+will\s+be\s+inserted|which\s+table\s+will\s+be\s+modified|which\s+fields\s+will\s+be\s+added|how\s+many\s+records\s+will\s+be\s+inserted)[?.!]*$", re.I),
     # A bare "show" is treated as a follow-up only when persisted session state exists.
     re.compile(r"^(?:show|display|list|view|see|check)(?:\s+me)?\??$", re.I),
     re.compile(r"^(?:can|could|may|would)\s+(?:you\s+)?(?:please\s+)?(?:show|display|list|let\s+me\s+see|help\s+me\s+see|view|see|check)\s+(?:me\s+)?(?:it|them|those|that|these|the\s+batch|the\s+list|the\s+records?|the\s+new\s+(?:ones|records?))\??$", re.I),

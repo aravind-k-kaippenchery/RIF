@@ -529,6 +529,7 @@ class AgentOrchestrator:
                 "question": result.question,
                 "route_decision": self._route_metadata(state),
                 "row_count": result.row_count,
+                "returned_row_count": len(result.rows),
                 "rows": result.rows,
                 "database_source": result.source,
                 "sql_proposal_explanation": result.proposal.explanation,

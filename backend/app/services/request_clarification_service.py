@@ -97,7 +97,6 @@ _DOCUMENT_TERMS = {
 }
 _REFERENCE_TERMS = {"it", "them", "those", "that", "one", "ones", "previous", "last", "new"}
 _GENERIC_DATA_TERMS = {"data", "record", "records", "row", "rows", "table", "tables", "entry", "entries"}
-_DANGEROUS_SQL_TERMS = {"drop", "truncate", "alter", "grant", "revoke", "shutdown", "vacuum"}
 
 # Deliberately explicit.  A future table must be approved in BUSINESS_TABLES before it
 # can be resolved here or sent to Faker/SQL generation.
@@ -278,6 +277,27 @@ def _has_record_selector(question: str) -> bool:
     return any(re.search(pattern, question, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _is_dangerous_sql_request(question: str) -> bool:
+    normalized = question.casefold()
+    return bool(
+        re.search(r"\b(drop|truncate|alter\s+table|grant|revoke|execute\s+immediate)\b", normalized)
+        or re.search(r";\s*(drop|truncate|delete|update|alter)\b", normalized)
+    )
+
+
+def _is_broad_delete_request(question: str) -> bool:
+    normalized = question.casefold()
+    has_delete = bool(re.search(r"\b(delete|remove)\b", normalized))
+    if not has_delete:
+        return False
+    broad_target = bool(re.search(r"\b(all|every|everything|entire|whole)\b", normalized))
+    explicit_safe_id = bool(
+        re.search(r"\b(?:id|code|email)\s*(?:=|is|:)?\s*[a-z0-9@._-]+", question, flags=re.IGNORECASE)
+        or re.search(r"\b(?:EMP|VEN|CUST|PROD)-[A-Z0-9-]+\b", question)
+    )
+    return broad_target and not explicit_safe_id
+
+
 def _has_update_value(question: str) -> bool:
     normalized = question.casefold()
     return bool(
@@ -286,36 +306,6 @@ def _has_update_value(question: str) -> bool:
         or "=" in normalized
     )
 
-
-
-
-def _synthetic_generation_requested(normalized: str, tokens: set[str]) -> bool:
-    """Return True only for explicit Faker/synthetic bulk-generation prompts.
-
-    The word "demo" can be a person's name ("Demo User") or a product/customer name.
-    Treating that as a generation signal caused normal inserts to be misrouted to the
-    synthetic-data flow.  Keep this detector intentionally strict.
-    """
-
-    if tokens & {"synthetic", "fake", "faker", "random", "randomly", "randomized", "generate", "generated", "seed", "populate"}:
-        return True
-
-    if "demo" in tokens or "sample" in tokens:
-        table_words = (
-            "employees?", "workers?", "vendors?", "suppliers?", "customers?", "clients?",
-            "products?", "items?", "sales\\s+deals?", "records?", "rows?", "data",
-        )
-        table_pattern = r"(?:" + "|".join(table_words) + r")"
-        if re.search(rf"\b(?:generate|seed|populate)\b.*\b(?:demo|sample)\b.*\b{table_pattern}\b", normalized):
-            return True
-        if re.search(rf"\b(?:generate|seed|populate)\b.*\b{table_pattern}\b", normalized):
-            return True
-        if re.search(rf"\b(?:create|add|make)\s+\d+\s+(?:demo|sample)\s+{table_pattern}\b", normalized):
-            return True
-        if re.search(rf"\b(?:demo|sample)\s+{table_pattern}\b", normalized) and re.search(r"\b(?:records?|data|rows?)\b", normalized):
-            return True
-
-    return False
 
 def analyze_request_clarity(question: str) -> ClarificationDecision:
     """Return a clarification decision before any LLM call or SQL generation."""
@@ -333,20 +323,34 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
     resolved_tables = resolve_business_tables(normalized)
     has_write = bool(tokens & _WRITE_VERBS)
     has_read = bool(tokens & _READ_VERBS)
-    has_generation = _synthetic_generation_requested(normalized.casefold(), tokens)
+    has_generation = bool(tokens & _GENERATION_SIGNALS)
     has_document = bool(tokens & _DOCUMENT_TERMS)
 
-    if tokens & _DANGEROUS_SQL_TERMS or re.search(r"\b(?:drop|truncate|alter)\s+(?:table\s+)?[a-z][a-z0-9_]*\b", normalized.casefold()):
+    if _is_dangerous_sql_request(normalized):
         return ClarificationDecision(
             True,
-            code="dangerous_sql_rejected",
+            code="dangerous_sql_blocked",
             message=(
-                "Dangerous SQL or schema-destructive commands are not allowed through the assistant. "
-                "Use the approved admin schema workflow for reviewed schema changes."
+                "Dangerous action blocked: DROP, TRUNCATE, ALTER, GRANT, REVOKE, and multi-statement destructive SQL are not allowed through the assistant."
             ),
-            missing_fields=(),
-            detected_intent="unsafe_sql",
-            details=[{"blocked_before_ollama": True, "database_touched": False}],
+            missing_fields=("safe_read_or_confirmation_gated_action",),
+            resolved_tables=resolved_tables,
+            detected_intent="dangerous_action",
+            details=[{"danger_level": "dangerous", "write_executed": False, "pending_action_created": False}],
+        )
+
+    if _is_broad_delete_request(normalized):
+        return ClarificationDecision(
+            True,
+            code="dangerous_delete_blocked",
+            message=(
+                "Dangerous action blocked: broad DELETE requests such as deleting all/every records are not converted into a pending action. "
+                "Provide one exact ID/business code if you need a safe delete preview."
+            ),
+            missing_fields=("exact_record_id_or_business_code",),
+            resolved_tables=resolved_tables,
+            detected_intent="dangerous_action",
+            details=[{"danger_level": "dangerous", "write_executed": False, "pending_action_created": False}],
         )
 
     if _schema_creation_requested(normalized):
@@ -468,14 +472,9 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
 
     if has_read:
         return ClarificationDecision(
-            True,
-            code="read_target_required",
-            message=(
-                "I do not have a clear table, record set, health component, or uploaded-document topic to answer. "
-                "Please specify the business table, document topic, or system component you mean."
-            ),
-            missing_fields=("target_table_or_document_topic",),
-            detected_intent="read_or_question",
+            False,
+            resolved_tables=resolved_tables,
+            detected_intent="document_question",
         )
 
     return ClarificationDecision(

@@ -962,3 +962,25 @@ button:focus-visible,
 /* Complete preview, confirmed-record, and clarification UX */
 .count-summary-strip{display:flex;align-items:stretch;gap:7px;flex-wrap:wrap;margin-top:10px}.count-summary-strip>span{display:grid;gap:1px;min-width:58px;padding:7px 9px;border:1px solid rgba(77,163,255,.14);border-radius:9px;background:rgba(77,163,255,.05)}.count-summary-strip small{color:#6f8da9;font-size:8px;text-transform:uppercase;letter-spacing:.05em}.count-summary-strip b{color:#d8ebff;font:700 12px 'JetBrains Mono',monospace}.record-action-button{display:inline-flex;align-items:center;gap:7px;margin-top:10px;padding:8px 10px;color:#bfe0ff;background:rgba(77,163,255,.09);border:1px solid rgba(77,163,255,.2);border-radius:9px;font-size:10px;font-weight:800}.record-action-button:hover{background:rgba(77,163,255,.16)}.record-action-button.success{color:#b8f4d4;background:rgba(55,196,126,.08);border-color:rgba(55,196,126,.22)}.record-action-button span{display:grid;place-items:center;min-width:22px;height:18px;padding:0 5px;border-radius:999px;background:rgba(255,255,255,.08);font:700 9px 'JetBrains Mono',monospace}.clarification-card{display:grid;gap:9px;margin-top:11px;padding:11px;border:1px solid rgba(245,185,66,.22);border-radius:10px;background:rgba(245,185,66,.06)}.clarification-card>div:first-child{display:flex;gap:8px;align-items:flex-start;color:#f4c86c}.clarification-card b{display:block;color:#ffe2a6;font-size:11px}.clarification-card small{display:block;margin-top:2px;color:#b89b67;font-size:9px}.clarification-fields,.clarification-options{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:#8fa7bc;font-size:9px}.clarification-fields code,.clarification-options code{padding:4px 6px;color:#c9e4ff;background:rgba(77,163,255,.07);border:1px solid rgba(77,163,255,.13);border-radius:6px;font:500 8px 'JetBrains Mono',monospace}.clarification-evidence p{margin:0 0 9px;color:#9fb2c5;font-size:10px;line-height:1.55}.evidence-record-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.evidence-record-heading h4{margin:0}.evidence-record-heading span{color:#7894ae;font:500 8px 'JetBrains Mono',monospace}.evidence-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px}.evidence-pagination>span{color:#7690a8;font:500 8px 'JetBrains Mono',monospace;text-align:center}.data-preview{overflow:auto}.preview-head,.preview-row{min-width:max-content}.preview-head span,.preview-row span{min-width:90px;max-width:180px}
 @media (max-width:720px){.count-summary-strip>span{min-width:72px}.evidence-pagination{flex-wrap:wrap;justify-content:center}}
+
+
+/* Data Explorer pagination/status helpers added by RIF data explorer fix. */
+.pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin: 0.75rem 0 1rem;
+  color: var(--text-muted, #64748b);
+  font-size: 0.9rem;
+}
+.muted-copy {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--text-muted, #64748b);
+}
+.table-option small {
+  margin-left: auto;
+  opacity: 0.7;
+  font-size: 0.72rem;
+}

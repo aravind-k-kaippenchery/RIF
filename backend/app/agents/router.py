@@ -28,8 +28,7 @@ _WRITE_VERBS = {
 _DOCUMENT_TERMS = {
     "brochure", "document", "documents", "manual", "guide", "faq", "specification", "specifications", "warranty",
     "policy", "pdf", "docx", "upload", "uploaded", "scanned", "image", "contract", "supports", "feature", "features",
-    "ticket", "tickets", "escalate", "escalated", "escalation", "response", "refund", "support", "onboarding", "compliance", "checklist", "catalog", "summary",
-    "keyword", "submit", "submitted", "required", "requirements", "must",
+    "ticket", "tickets", "escalate", "escalated", "response", "refund", "support", "onboarding", "compliance", "checklist", "catalog", "summary",
 }
 _DATABASE_TERMS = {
     "employee", "employees", "worker", "workers", "vendor", "vendors", "supplier", "suppliers",
@@ -69,13 +68,23 @@ def classify_question(question: str) -> RouteDecision:
             reason="A create, update, or delete-style verb was detected; the request must use the confirmation-gated CRUD path.",
         )
 
-    document_only_shape = bool(
-        re.search(r"\b(?:what|which)\s+documents?\b", normalized)
-        or re.search(r"\b(?:unique|reference)\s+.*\bkeyword\b", normalized)
-        or re.search(r"\b(?:find|search)\b.*\b(?:document|keyword|policy|faq|checklist|catalog)\b", normalized)
+    explicit_document_question = bool(
+        re.search(r"\b(?:document|documents|pdf|uploaded\s+documents?|file|files|checklist|faq)\b", normalized)
+        and re.search(r"\b(?:what|which|when|where|why|how|say|says|contain|contains|summarize|explain|tell)\b", normalized)
     )
+    explicit_hybrid_action = bool(
+        re.search(r"\b(?:how\s+many|count|list|show)\b", normalized)
+        and has_database_terms
+        and re.search(r"\b(?:and|with|along\s+with)\b", normalized)
+    )
+    if has_document_terms and explicit_document_question and not explicit_hybrid_action:
+        return RouteDecision(
+            route=AgentRoute.DOCUMENT_RAG,
+            confidence=0.93,
+            reason="The question explicitly asks what an uploaded document says, so document RAG is the primary evidence source instead of hybrid database fusion.",
+        )
 
-    if has_document_terms and has_hybrid_database_terms and not document_only_shape:
+    if has_document_terms and has_hybrid_database_terms:
         return RouteDecision(
             route=AgentRoute.HYBRID,
             confidence=0.90,
@@ -89,11 +98,11 @@ def classify_question(question: str) -> RouteDecision:
             reason="The question asks for product/document knowledge, so local document retrieval is the primary evidence source.",
         )
 
-    if is_open_question and not has_database_terms and has_document_terms:
+    if is_open_question and not has_database_terms:
         return RouteDecision(
             route=AgentRoute.DOCUMENT_RAG,
             confidence=0.72,
-            reason="The question is read-only and contains an uploaded-document signal, so document RAG is used.",
+            reason="The question is read-only and does not name a database table, so uploaded documents are searched before asking for clarification.",
         )
 
     if has_database_terms:
