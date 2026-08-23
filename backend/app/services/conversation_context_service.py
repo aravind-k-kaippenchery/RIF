@@ -23,12 +23,15 @@ import re
 from typing import Any
 from uuid import UUID
 
+import sqlglot
+from sqlglot import exp
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 
 from app.core.constants import AgentRoute, ResponseStatus
 from app.models.operations import ActionLog, PendingAction, QueryLog
+from app.services.dynamic_pgsql_schema import get_runtime_columns
 
 
 _FAILURE_STATUSES = {
@@ -545,27 +548,177 @@ def conversation_reference_from_result(
     route: str,
     status: str,
     data: dict[str, Any] | None,
+    generated_sql: str | None = None,
 ) -> dict[str, Any] | None:
-    """Create a compact query-log reference tying a turn to its persisted action."""
+    """Create compact action or table-result state without storing returned rows."""
 
     payload = data if isinstance(data, dict) else {}
     pending = payload.get("pending_action") if isinstance(payload.get("pending_action"), dict) else {}
     preview = payload.get("preview") if isinstance(payload.get("preview"), dict) else {}
     resolved = payload.get("resolved_reference") if isinstance(payload.get("resolved_reference"), dict) else {}
+    schema_metadata = payload.get("schema_metadata") if isinstance(payload.get("schema_metadata"), dict) else {}
+    clarification = payload.get("clarification") if isinstance(payload.get("clarification"), dict) else {}
     action_id = pending_action_id or pending.get("pending_action_id") or resolved.get("pending_action_id")
-    target_table = pending.get("target_table") or preview.get("target_table") or resolved.get("target_table")
+    target_table = (
+        pending.get("target_table")
+        or preview.get("target_table")
+        or resolved.get("target_table")
+        or schema_metadata.get("table_name")
+        or schema_metadata.get("canonical_table")
+    )
     record_count = (
         payload.get("record_count")
         or payload.get("generated_record_count")
         or preview.get("record_count")
         or resolved.get("record_count")
     )
+    if not target_table:
+        target_table = payload.get("target_table")
+    if not target_table:
+        database_source = payload.get("database_source")
+        source_tables = database_source.get("tables") if isinstance(database_source, dict) else None
+        if isinstance(source_tables, list) and len(source_tables) == 1:
+            target_table = source_tables[0]
+    if not isinstance(record_count, int):
+        payload_count = payload.get("row_count")
+        record_count = payload_count if isinstance(payload_count, int) else None
+
+    # Persist the missing-field contract for a later short reply such as ``orders``.
+    # No generated records, rows, or unrestricted user data are copied into memory.
+    clarification_code = clarification.get("code")
+    if status == ResponseStatus.CLARIFICATION_REQUIRED.value and clarification_code:
+        resolved_tables = clarification.get("resolved_tables")
+        normalized_tables = [str(item) for item in resolved_tables] if isinstance(resolved_tables, list) else []
+        return {
+            "reference_type": "clarification",
+            "clarification_code": str(clarification_code),
+            "missing_fields": [str(item) for item in clarification.get("missing_fields") or []],
+            "resolved_tables": normalized_tables,
+            "detected_intent": clarification.get("detected_intent"),
+            "target_table": str(target_table) if target_table else (normalized_tables[0] if len(normalized_tables) == 1 else None),
+            "route": route,
+            "status": status,
+        }
+
+    # Successful live schema questions identify one current table just as safely as a
+    # bounded row read. Store only that table reference so a later ``it`` can resolve
+    # without Ollama or a table-specific alias.
+    if (
+        not action_id
+        and target_table
+        and schema_metadata
+        and status == ResponseStatus.SUCCESS.value
+    ):
+        return {
+            "reference_type": "table_metadata",
+            "pending_action_id": None,
+            "target_table": str(target_table),
+            "filters": {},
+            "filters_complete": True,
+            "relationship_filter": {},
+            "record_count": None,
+            "route": route,
+            "status": status,
+        }
     if not action_id and route != AgentRoute.CRUD_WRITE.value:
-        return None
+        if route != AgentRoute.STRUCTURED_READ.value or not target_table:
+            return None
+        filters = payload.get("applied_filters")
+        if not isinstance(filters, dict):
+            filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+        filters_complete = True
+        if generated_sql and not filters:
+            filters, filters_complete = _safe_equality_filters_from_sql(
+                generated_sql,
+                target_table=str(target_table),
+            )
+        relationship = payload.get("applied_relationship_filter")
+        if not isinstance(relationship, dict):
+            relationship = payload.get("relationship_filter") if isinstance(payload.get("relationship_filter"), dict) else {}
+        relationship_filter = {
+            key: relationship.get(key)
+            for key in ("parent_table", "parent_column", "parent_value")
+            if key in relationship
+        }
+        return {
+            "reference_type": "table_result",
+            "pending_action_id": None,
+            "target_table": str(target_table),
+            "filters": _json_safe(filters),
+            "filters_complete": filters_complete,
+            "relationship_filter": _json_safe(relationship_filter),
+            "record_count": record_count,
+            "route": route,
+            "status": status,
+        }
     return {
+        "reference_type": "action",
         "pending_action_id": str(action_id) if action_id else None,
         "target_table": target_table,
         "record_count": int(record_count) if isinstance(record_count, int) else None,
         "route": route,
         "status": status,
     }
+
+
+def _safe_equality_filters_from_sql(sql: str, *, target_table: str) -> tuple[dict[str, Any], bool]:
+    """Extract replayable equality predicates from one validated single-table SELECT."""
+
+    try:
+        expression = sqlglot.parse_one(sql, read="postgres")
+    except sqlglot.errors.ParseError:
+        return {}, False
+    tables = {str(table.name).strip().lower() for table in expression.find_all(exp.Table)}
+    normalized_table = str(target_table or "").strip().lower()
+    if tables != {normalized_table}:
+        return {}, False
+    live_columns = set(get_runtime_columns(normalized_table))
+    where = expression.args.get("where")
+    if where is None:
+        return {}, True
+
+    def predicates(node: exp.Expression) -> list[exp.Expression]:
+        if isinstance(node, exp.Where):
+            return predicates(node.this)
+        if isinstance(node, exp.And):
+            return predicates(node.left) + predicates(node.right)
+        return [node]
+
+    filters: dict[str, Any] = {}
+    for predicate in predicates(where):
+        if not isinstance(predicate, exp.EQ):
+            return {}, False
+        left_columns = list(predicate.left.find_all(exp.Column))
+        right_columns = list(predicate.right.find_all(exp.Column))
+        if isinstance(predicate.left, exp.Column) and predicate.left not in left_columns:
+            left_columns.insert(0, predicate.left)
+        if isinstance(predicate.right, exp.Column) and predicate.right not in right_columns:
+            right_columns.insert(0, predicate.right)
+        columns = left_columns + right_columns
+        if len(columns) != 1 or (left_columns and right_columns):
+            return {}, False
+        column_name = str(columns[0].name).strip().lower()
+        if column_name not in live_columns or column_name in filters:
+            return {}, False
+        literal_side = predicate.right if left_columns else predicate.left
+        if isinstance(literal_side, exp.Literal):
+            if literal_side.is_string:
+                value: Any = literal_side.this
+            else:
+                number = str(literal_side.this)
+                try:
+                    value = int(number)
+                except ValueError:
+                    try:
+                        value = float(number)
+                    except ValueError:
+                        return {}, False
+        elif isinstance(literal_side, exp.Boolean):
+            boolean_value = literal_side.this
+            value = boolean_value if isinstance(boolean_value, bool) else str(boolean_value).casefold() == "true"
+        elif isinstance(literal_side, exp.Null):
+            value = None
+        else:
+            return {}, False
+        filters[column_name] = value
+    return filters, True

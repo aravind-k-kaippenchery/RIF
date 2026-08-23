@@ -215,6 +215,11 @@ def execute_confirmed_schema_change(
             message="The restricted schema change could not be applied. No partial schema result was reported.",
         ) from exc
 
+    # A newly created/altered table must be visible to schema-aware reads and Faker
+    # immediately, without requiring a backend restart.
+    from app.services.dynamic_pgsql_schema import clear_reflection_cache
+
+    clear_reflection_cache()
     return {
         "executed": True,
         "idempotent": False,

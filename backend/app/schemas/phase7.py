@@ -46,6 +46,20 @@ class BulkWriteProposalRequest(BaseModel):
         return value.strip().lower()
 
 
+class DuplicateCheckRequest(BaseModel):
+    """Read-only duplicate lookup against reflected PostgreSQL constraints."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    target_table: str = Field(min_length=1, max_length=128)
+    values: dict[str, Any] = Field(min_length=1)
+
+    @field_validator("target_table")
+    @classmethod
+    def normalize_duplicate_table_name(cls, value: str) -> str:
+        return value.strip().lower()
+
+
 class SyntheticEmployeeProposalRequest(BaseModel):
     """Generate synthetic employee records, then create the usual confirmation-gated bulk preview."""
 

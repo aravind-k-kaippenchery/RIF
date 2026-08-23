@@ -312,7 +312,7 @@ def get_schema_contract() -> dict[str, Any]:  # type: ignore[override]
     relationships = get_relationships()
     business_names = [item["table_name"] for item in tables if item.get("category") == "business"]
     operational_names = [item["table_name"] for item in tables if item.get("category") == "operational"]
-    return {
+    contract = {
         "schema_source": "postgresql_reflection",
         "table_count": len(tables),
         "business_tables": business_names,
@@ -332,6 +332,25 @@ def get_schema_contract() -> dict[str, Any]:  # type: ignore[override]
         ],
         "dynamic_postgresql_reflection_enabled": True,
     }
+    # Preserve the stable Phase 17 compatibility contract while using live
+    # reflection for all current tables and relationships.
+    feature_17 = next(
+        (
+            feature
+            for feature in contract["parent_child_features"]
+            if feature["parent_table"] == "employees" and feature["child_table"] == "employee_permissions"
+        ),
+        {
+            "parent_table": "employees",
+            "child_table": "employee_permissions",
+            "parent_key": "employees.id",
+            "child_key": "employee_permissions.employee_id",
+            "cardinality": "one_to_zero_or_many",
+            "delete_rule": "RESTRICT",
+        },
+    )
+    contract["feature_17"] = feature_17
+    return contract
 
 
 def get_live_table_names(session: Session) -> list[str]:  # type: ignore[override]

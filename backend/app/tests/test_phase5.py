@@ -176,6 +176,37 @@ def test_grounded_answer_without_evidence_does_not_call_ollama():
     assert metadata is None
 
 
+def test_grounded_answer_rejects_hallucinated_fact_even_with_valid_citation():
+    service = LLMService()
+    evidence = [{"source_type": "database", "reference": "employees", "content": "Maya works in Bangalore."}]
+    responses = [
+        _chat_body('{"answer":"Maya works in Kochi.","supported":true,"source_references":["employees"]}'),
+        _chat_body('{"answer":"Maya works in Bangalore.","supported":true,"source_references":["employees"]}'),
+    ]
+
+    with patch.object(service, "check_llm_health", return_value=READY), patch.object(service, "_send_chat_request", side_effect=responses) as mock_send:
+        result, metadata = service.generate_grounded_answer("Where does Maya work?", evidence)
+
+    assert result.answer == "Maya works in Bangalore."
+    assert metadata is not None and metadata.attempts == 2
+    assert mock_send.call_count == 2
+
+
+def test_grounded_answer_rejects_changed_relationship():
+    service = LLMService()
+    evidence = [{"source_type": "document", "reference": "doc:1", "content": "Maya works in Bangalore."}]
+    responses = [
+        _chat_body('{"answer":"Maya lives in Bangalore.","supported":true,"source_references":["doc:1"]}'),
+        _chat_body('{"answer":"Information not available in the provided evidence.","supported":false,"source_references":[]}'),
+    ]
+
+    with patch.object(service, "check_llm_health", return_value=READY), patch.object(service, "_send_chat_request", side_effect=responses):
+        result, metadata = service.generate_grounded_answer("Where does Maya live?", evidence)
+
+    assert result.supported is False
+    assert metadata is not None and metadata.attempts == 2
+
+
 def test_llm_status_endpoint_reports_safe_unavailable_state_without_inference():
     unavailable = OllamaHealth(
         connected=False,

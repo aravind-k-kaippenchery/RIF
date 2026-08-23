@@ -1,16 +1,16 @@
-"""Schema-aware Faker generation for approved business tables.
+"""Schema-aware Faker generation for reflected PostgreSQL business tables.
 
 The service is intentionally deterministic at the safety boundary:
 
 * It only recognizes explicit synthetic/demo/random generation requests.
-* It only targets tables listed in ``schema_registry.BUSINESS_TABLES``.
+* It discovers eligible targets from the live PostgreSQL ``public`` schema.
 * It never writes to PostgreSQL directly.
 * Foreign keys are selected from existing parent rows.
 * Generated records always enter the existing duplicate-check and confirmation flow.
 
-Current tables have dedicated profiles. A conservative metadata-based fallback makes
-future approved business tables usable when their required columns use ordinary names
-and types. Complex future tables can register a dedicated profile in ``PROFILE_REGISTRY``.
+Current tables keep their dedicated profiles. A conservative reflection-based fallback
+makes manually-created business tables usable without adding them to a Python allowlist.
+Complex tables can still register a dedicated profile in ``PROFILE_REGISTRY``.
 """
 
 from __future__ import annotations
@@ -28,8 +28,9 @@ from faker import Faker
 from sqlalchemy import Boolean, Date, DateTime, Integer, Numeric, String, Text, select
 from sqlalchemy.orm import Session
 
-from app.models import Base
-from app.services.schema_registry import BUSINESS_TABLES
+from app.services.duplicate_service import find_batch_duplicates, get_unique_key_sets
+from app.services.dynamic_pgsql_schema import get_public_table_names, get_runtime_table
+from app.services.schema_registry import OPERATIONAL_TABLES
 
 
 MAX_SYNTHETIC_RECORDS = 50
@@ -269,11 +270,19 @@ def _phrase_pattern(phrase: str) -> str:
     return r"[\s_-]+".join(parts)
 
 
+def _synthetic_table_names() -> list[str]:
+    """Return reflected public tables that Faker may safely target."""
+
+    protected = {str(name).strip().lower() for name in OPERATIONAL_TABLES}
+    return [name for name in get_public_table_names() if name not in protected]
+
+
 def _target_from_prompt(question: str) -> str | None:
     normalized = question.casefold()
+    available_tables = _synthetic_table_names()
 
-    # Explicit table wording wins over a generic noun such as "people".
-    for table_name in sorted(BUSINESS_TABLES, key=len, reverse=True):
+    # Exact reflected table wording wins over a generic noun such as "people".
+    for table_name in sorted(available_tables, key=len, reverse=True):
         readable = table_name.replace("_", " ")
         patterns = (
             rf"\b(?:in|into|to|for|inside)\s+(?:the\s+)?{_phrase_pattern(readable)}\s+table\b",
@@ -283,9 +292,10 @@ def _target_from_prompt(question: str) -> str | None:
         if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns):
             return table_name
 
+    # Preserve friendly aliases only for the original registered profiles.
     aliases: list[tuple[int, str, str]] = []
     for table_name, values in TABLE_ALIASES.items():
-        if table_name not in BUSINESS_TABLES:
+        if table_name not in available_tables:
             continue
         for alias in values:
             aliases.append((len(alias), table_name, alias))
@@ -439,12 +449,6 @@ def parse_synthetic_data_prompt(question: str) -> SyntheticDataRequest | None:
     if not has_generation_signal:
         return None
 
-    if target_table not in BUSINESS_TABLES:
-        raise SyntheticDataGenerationError(
-            "synthetic_target_not_allowed",
-            f"Synthetic generation is not allowed for table '{target_table}'.",
-        )
-
     count = _extract_count(normalized, target_table)
     if count is None:
         raise SyntheticDataGenerationError(
@@ -468,16 +472,16 @@ def parse_synthetic_data_prompt(question: str) -> SyntheticDataRequest | None:
 
 def validate_synthetic_data_request(request: SyntheticDataRequest) -> SyntheticDataRequest:
     target_table = request.target_table.strip().lower()
-    if target_table not in BUSINESS_TABLES:
+    if target_table in OPERATIONAL_TABLES:
         raise SyntheticDataGenerationError(
             "synthetic_target_not_allowed",
-            "Synthetic generation is limited to approved business tables.",
-            details=[{"target_table": target_table, "supported_tables": list(BUSINESS_TABLES)}],
+            "Synthetic generation is not allowed for operational/audit tables.",
+            details=[{"target_table": target_table}],
         )
-    if target_table not in Base.metadata.tables:
+    if target_table not in set(_synthetic_table_names()):
         raise SyntheticDataGenerationError(
             "synthetic_target_unavailable",
-            f"The approved table '{target_table}' is not present in SQLAlchemy metadata.",
+            f"Table '{target_table}' is not present in the reflected PostgreSQL public schema.",
         )
     if not 1 <= int(request.count) <= MAX_SYNTHETIC_RECORDS:
         raise SyntheticDataGenerationError(
@@ -523,8 +527,10 @@ def _table_rows(
     *,
     filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    table = Base.metadata.tables[table_name]
-    selected = [table.c[name] for name in columns]
+    table = get_runtime_table(table_name, bind=db.bind)
+    selected = [table.c[name] for name in columns if name in table.c]
+    if not selected:
+        return []
     statement = select(*selected)
     for key, value in (filters or {}).items():
         if key in table.c and value not in (None, ""):
@@ -832,8 +838,9 @@ def _generic_foreign_key_values(db: Session, table: Any) -> dict[str, list[Any]]
         for foreign_key in column.foreign_keys:
             parent_table_name = foreign_key.column.table.name
             parent_column_name = foreign_key.column.name
-            parent_table = Base.metadata.tables.get(parent_table_name)
-            if parent_table is None:
+            try:
+                parent_table = get_runtime_table(parent_table_name, bind=db.bind)
+            except KeyError:
                 continue
             rows = db.execute(select(parent_table.c[parent_column_name])).scalars().all()
             if not rows and not column.nullable:
@@ -846,6 +853,130 @@ def _generic_foreign_key_values(db: Session, table: Any) -> dict[str, list[Any]]
     return values
 
 
+def _database_generates_column(column: Any) -> bool:
+    """Return whether INSERT must leave a reflected column to PostgreSQL."""
+
+    if getattr(column, "identity", None) is not None:
+        return True
+    if getattr(column, "computed", None) is not None:
+        return True
+    if column.server_default is not None:
+        return True
+    if column.primary_key and getattr(column, "autoincrement", False) in (True, "auto"):
+        return isinstance(column.type, Integer)
+    return False
+
+
+def _bounded_unique_text(
+    *,
+    table_name: str,
+    column_name: str,
+    batch_id: str,
+    index: int,
+    request_count: int,
+    length: int | None,
+) -> str:
+    """Build a compact unique token while preserving its row suffix after truncation."""
+
+    suffix_width = len(str(max(1, request_count)))
+    suffix = str(index).zfill(suffix_width)
+    if length is not None and length < suffix_width:
+        raise SyntheticDataGenerationError(
+            "synthetic_unique_column_too_short",
+            f"Unique column '{column_name}' in '{table_name}' is too short for {request_count} distinct synthetic values.",
+            details=[
+                {
+                    "table_name": table_name,
+                    "column_name": column_name,
+                    "maximum_length": length,
+                    "requested_record_count": request_count,
+                }
+            ],
+        )
+
+    prefix = re.sub(r"[^a-z0-9]+", "", f"{table_name}-{column_name}-{batch_id}".casefold()) or "record"
+    if length is None:
+        return f"{prefix}-{suffix}"
+    if length == suffix_width:
+        return suffix
+    head_length = length - suffix_width - 1
+    if head_length <= 0:
+        return suffix[-length:]
+    return f"{prefix[:head_length]}-{suffix}"
+
+
+def _unique_column_value(
+    faker: Faker,
+    *,
+    column: Any,
+    table_name: str,
+    batch_id: str,
+    index: int,
+    request_count: int,
+    foreign_key_values: dict[str, list[Any]],
+) -> Any:
+    """Generate a distinct value for one reflected singleton unique key."""
+
+    if column.name in foreign_key_values:
+        choices = foreign_key_values[column.name]
+        if len(choices) < request_count:
+            raise SyntheticDataGenerationError(
+                "synthetic_unique_foreign_keys_unavailable",
+                (
+                    f"Table '{table_name}' needs {request_count} distinct parent values for unique foreign-key column "
+                    f"'{column.name}', but only {len(choices)} are available."
+                ),
+                details=[
+                    {
+                        "table_name": table_name,
+                        "column_name": column.name,
+                        "requested_record_count": request_count,
+                        "available_parent_values": len(choices),
+                    }
+                ],
+            )
+        return choices[index - 1]
+
+    column_type = column.type
+    if isinstance(column_type, Boolean):
+        if request_count > 2:
+            raise SyntheticDataGenerationError(
+                "synthetic_unique_boolean_domain_exhausted",
+                f"Unique Boolean column '{column.name}' can provide at most two distinct values.",
+                details=[{"table_name": table_name, "column_name": column.name, "requested_record_count": request_count}],
+            )
+        return index == 1
+    if isinstance(column_type, Integer):
+        type_name = column_type.__class__.__name__.casefold()
+        ceiling = 32_000 if "small" in type_name else 2_000_000_000
+        seed = int(batch_id[:8], 16) % max(1, ceiling - request_count - 1)
+        return seed + index
+    if isinstance(column_type, Numeric):
+        seed = int(batch_id[:8], 16) % 10_000_000
+        return float(seed + index)
+    if isinstance(column_type, DateTime):
+        return f"{date.today().isoformat()}T00:00:{index:02d}"
+    if isinstance(column_type, Date):
+        return (date.today() + timedelta(days=index)).isoformat()
+    if isinstance(column_type, (String, Text)):
+        return _bounded_unique_text(
+            table_name=table_name,
+            column_name=column.name,
+            batch_id=batch_id,
+            index=index,
+            request_count=request_count,
+            length=getattr(column_type, "length", None),
+        )
+    return _bounded_unique_text(
+        table_name=table_name,
+        column_name=column.name,
+        batch_id=batch_id,
+        index=index,
+        request_count=request_count,
+        length=None,
+    )
+
+
 def _generic_column_value(
     faker: Faker,
     *,
@@ -853,8 +984,20 @@ def _generic_column_value(
     table_name: str,
     batch_id: str,
     index: int,
+    request_count: int,
     foreign_key_values: dict[str, list[Any]],
+    force_unique: bool = False,
 ) -> Any:
+    if force_unique:
+        return _unique_column_value(
+            faker,
+            column=column,
+            table_name=table_name,
+            batch_id=batch_id,
+            index=index,
+            request_count=request_count,
+            foreign_key_values=foreign_key_values,
+        )
     if column.name in foreign_key_values:
         choices = foreign_key_values[column.name]
         return choices[(index - 1) % len(choices)] if choices else None
@@ -899,15 +1042,17 @@ def _generic_column_value(
 
 
 def _generate_from_schema(db: Session, faker: Faker, request: SyntheticDataRequest, batch_id: str) -> list[dict[str, Any]]:
-    """Conservative fallback for future approved tables with ordinary columns."""
+    """Conservative fallback for reflected tables with ordinary columns."""
 
-    table = Base.metadata.tables[request.target_table]
+    table = get_runtime_table(request.target_table, bind=db.bind)
     foreign_key_values = _generic_foreign_key_values(db, table)
+    unique_key_sets = get_unique_key_sets(db, request.target_table)
+    singleton_unique_columns = {keys[0] for keys in unique_key_sets if len(keys) == 1}
     records: list[dict[str, Any]] = []
     for index in range(1, request.count + 1):
         record: dict[str, Any] = {}
         for column in table.columns:
-            if column.name in MANAGED_COLUMNS or column.primary_key:
+            if column.name in MANAGED_COLUMNS or _database_generates_column(column):
                 continue
             if column.name in request.constraints:
                 record[column.name] = request.constraints[column.name]
@@ -921,9 +1066,61 @@ def _generate_from_schema(db: Session, faker: Faker, request: SyntheticDataReque
                     table_name=request.target_table,
                     batch_id=batch_id,
                     index=index,
+                    request_count=request.count,
                     foreign_key_values=foreign_key_values,
+                    force_unique=column.name in singleton_unique_columns,
                 )
         records.append(record)
+
+    # Singleton unique columns are generated distinctly above. For composite unique
+    # constraints, repair a colliding key through one non-FK generated member while
+    # preserving every explicit user constraint and every valid parent reference.
+    for _ in range(max(1, len(unique_key_sets))):
+        collisions = find_batch_duplicates(request.target_table, records, db)
+        if not collisions:
+            break
+        repaired = False
+        for collision in collisions:
+            duplicate_index = int(collision["duplicate_record_index"])
+            key_fields = [str(item) for item in collision.get("key_fields") or []]
+            candidate_name = next(
+                (
+                    name
+                    for name in key_fields
+                    if name in table.c
+                    and name in records[duplicate_index]
+                    and name not in request.constraints
+                    and not table.c[name].foreign_keys
+                    and not _database_generates_column(table.c[name])
+                ),
+                None,
+            )
+            if candidate_name is None:
+                continue
+            column = table.c[candidate_name]
+            records[duplicate_index][candidate_name] = _unique_column_value(
+                faker,
+                column=column,
+                table_name=request.target_table,
+                batch_id=batch_id,
+                index=duplicate_index + 1,
+                request_count=request.count,
+                foreign_key_values=foreign_key_values,
+            )
+            repaired = True
+        if not repaired:
+            break
+
+    remaining_collisions = find_batch_duplicates(request.target_table, records, db)
+    if remaining_collisions:
+        raise SyntheticDataGenerationError(
+            "synthetic_unique_values_unavailable",
+            (
+                f"The live unique constraints on '{request.target_table}' cannot support {request.count} distinct "
+                "synthetic rows with the currently available parent records or requested fixed values."
+            ),
+            details=remaining_collisions,
+        )
     return records
 
 
@@ -948,7 +1145,7 @@ def generate_synthetic_records(db: Session, request: SyntheticDataRequest) -> Sy
 
     metadata = {
         "generator": "faker",
-        "generator_mode": "registered_profile" if profile is not None else "schema_fallback",
+        "generator_mode": "registered_profile" if profile is not None else "schema_fallback_reflected_postgresql",
         "synthetic_data_only": True,
         "faker_locale": DEFAULT_FAKER_LOCALE,
         "batch_id": batch_id,
@@ -956,9 +1153,10 @@ def generate_synthetic_records(db: Session, request: SyntheticDataRequest) -> Sy
         "generated_record_count": len(records),
         "target_table": request.target_table,
         "constraints": request.constraints,
-        "supported_tables": list(BUSINESS_TABLES),
+        "supported_tables": _synthetic_table_names(),
         "foreign_keys_use_existing_parent_rows": True,
         "confirmation_required": True,
+        "schema_source": "postgresql_reflection",
     }
     return SyntheticDataBatch(target_table=request.target_table, records=records, metadata=metadata)
 
@@ -969,212 +1167,8 @@ def supported_synthetic_tables() -> list[dict[str, Any]]:
     return [
         {
             "table_name": table_name,
-            "generator_mode": "registered_profile" if table_name in PROFILE_REGISTRY else "schema_fallback",
-        }
-        for table_name in BUSINESS_TABLES
-        if table_name in Base.metadata.tables
-    ]
-
-# BEGIN RIF FULL PGSQL SYNTHETIC OVERRIDE
-# Runtime PostgreSQL reflection override: generic Faker can target reflected public data tables.
-from app.services.dynamic_pgsql_schema import (
-    get_public_table_names as _rif_get_public_table_names,
-    get_runtime_table as _rif_get_runtime_table,
-    has_public_table as _rif_has_public_table,
-)
-from app.services.schema_registry import OPERATIONAL_TABLES as _rif_operational_tables
-
-
-def _rif_dynamic_target_from_prompt(question: str) -> str | None:
-    normalized = " ".join(str(question or "").strip().split()).casefold()
-    if not normalized:
-        return None
-    candidates: list[tuple[int, str, str]] = []
-    for table_name in _rif_get_public_table_names():
-        if table_name in _rif_operational_tables:
-            continue
-        readable = table_name.replace("_", " ")
-        aliases = {table_name, readable}
-        if readable.endswith("s") and len(readable) > 3:
-            aliases.add(readable[:-1])
-        if table_name.endswith("s") and len(table_name) > 3:
-            aliases.add(table_name[:-1])
-            aliases.add(table_name[:-1].replace("_", " "))
-        for alias in aliases:
-            candidates.append((len(alias), table_name, alias))
-    for _, table_name, alias in sorted(candidates, reverse=True):
-        if re.search(rf"{_phrase_pattern(alias)}", normalized, flags=re.IGNORECASE):
-            return table_name
-    return None
-
-
-def parse_synthetic_data_prompt(question: str) -> SyntheticDataRequest | None:  # type: ignore[override]
-    normalized = " ".join(str(question or "").strip().split())
-    if not normalized:
-        return None
-    target_table = _rif_dynamic_target_from_prompt(normalized)
-    if target_table is None:
-        return None
-    tokens = set(re.findall(r"[a-z0-9_-]+", normalized.casefold()))
-    has_generation_signal = bool(tokens & _GENERATION_SIGNALS)
-    if not has_generation_signal:
-        return None
-    count = _extract_count(normalized, target_table)
-    if count is None:
-        raise SyntheticDataGenerationError(
-            "synthetic_record_count_required",
-            f"State how many synthetic records to generate, from 1 to {MAX_SYNTHETIC_RECORDS}.",
-        )
-    if not 1 <= count <= MAX_SYNTHETIC_RECORDS:
-        raise SyntheticDataGenerationError(
-            "synthetic_record_count_out_of_range",
-            f"Synthetic generation supports between 1 and {MAX_SYNTHETIC_RECORDS} records per preview.",
-            details=[{"requested_count": count, "minimum": 1, "maximum": MAX_SYNTHETIC_RECORDS}],
-        )
-    return SyntheticDataRequest(
-        target_table=target_table,
-        count=count,
-        constraints=_constraints_from_prompt(normalized, target_table),
-        source_text=normalized,
-    )
-
-
-def validate_synthetic_data_request(request: SyntheticDataRequest) -> SyntheticDataRequest:  # type: ignore[override]
-    target_table = str(request.target_table or "").strip().lower()
-    if target_table in _rif_operational_tables:
-        raise SyntheticDataGenerationError(
-            "synthetic_target_not_allowed",
-            "Synthetic generation is not allowed for operational/audit tables.",
-            details=[{"target_table": target_table}],
-        )
-    if not _rif_has_public_table(target_table):
-        raise SyntheticDataGenerationError(
-            "synthetic_target_unavailable",
-            f"Table '{target_table}' is not present in the reflected PostgreSQL public schema.",
-        )
-    if not 1 <= int(request.count) <= MAX_SYNTHETIC_RECORDS:
-        raise SyntheticDataGenerationError(
-            "synthetic_record_count_out_of_range",
-            f"Synthetic generation supports between 1 and {MAX_SYNTHETIC_RECORDS} records per preview.",
-        )
-    constraints = {
-        str(key).strip().lower(): value
-        for key, value in dict(request.constraints or {}).items()
-        if str(key).strip()
-    }
-    return SyntheticDataRequest(
-        target_table=target_table,
-        count=int(request.count),
-        constraints=constraints,
-        source_text=request.source_text,
-    )
-
-
-def _table_rows(  # type: ignore[override]
-    db: Session,
-    table_name: str,
-    columns: tuple[str, ...],
-    *,
-    filters: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    table = _rif_get_runtime_table(table_name, bind=db.bind)
-    selected = [table.c[name] for name in columns if name in table.c]
-    if not selected:
-        return []
-    statement = select(*selected)
-    for key, value in (filters or {}).items():
-        if key in table.c and value not in (None, ""):
-            statement = statement.where(table.c[key] == value)
-    return [dict(row) for row in db.execute(statement).mappings().all()]
-
-
-def _generic_foreign_key_values(db: Session, table: Any) -> dict[str, list[Any]]:  # type: ignore[override]
-    values: dict[str, list[Any]] = {}
-    for column in table.columns:
-        for foreign_key in column.foreign_keys:
-            parent_table_name = foreign_key.column.table.name
-            parent_column_name = foreign_key.column.name
-            try:
-                parent_table = _rif_get_runtime_table(parent_table_name, bind=db.bind)
-            except KeyError:
-                continue
-            rows = db.execute(select(parent_table.c[parent_column_name])).scalars().all()
-            if not rows and not column.nullable:
-                raise SyntheticDataGenerationError(
-                    "synthetic_parent_records_required",
-                    f"Create a parent record in '{parent_table_name}' before generating '{table.name}' records.",
-                    details=[{"child_table": table.name, "foreign_key_column": column.name, "parent_table": parent_table_name}],
-                )
-            values[column.name] = list(rows)
-    return values
-
-
-def _generate_from_schema(db: Session, faker: Faker, request: SyntheticDataRequest, batch_id: str) -> list[dict[str, Any]]:  # type: ignore[override]
-    table = _rif_get_runtime_table(request.target_table, bind=db.bind)
-    foreign_key_values = _generic_foreign_key_values(db, table)
-    records: list[dict[str, Any]] = []
-    for index in range(1, request.count + 1):
-        record: dict[str, Any] = {}
-        for column in table.columns:
-            if column.name in MANAGED_COLUMNS or column.primary_key:
-                continue
-            if column.name in request.constraints:
-                record[column.name] = request.constraints[column.name]
-                continue
-            required = not column.nullable and column.default is None and column.server_default is None
-            common_optional = any(token in column.name.casefold() for token in ("code", "name", "email", "phone", "city", "status"))
-            if required or common_optional or column.foreign_keys:
-                record[column.name] = _generic_column_value(
-                    faker,
-                    column=column,
-                    table_name=request.target_table,
-                    batch_id=batch_id,
-                    index=index,
-                    foreign_key_values=foreign_key_values,
-                )
-        records.append(record)
-    return records
-
-
-def generate_synthetic_records(db: Session, request: SyntheticDataRequest) -> SyntheticDataBatch:  # type: ignore[override]
-    request = validate_synthetic_data_request(request)
-    faker = Faker(DEFAULT_FAKER_LOCALE)
-    batch_id = uuid4().hex[:10].upper()
-    profile = PROFILE_REGISTRY.get(request.target_table)
-    records = profile(db, faker, request, batch_id) if profile is not None else _generate_from_schema(db, faker, request, batch_id)
-    if len(records) != request.count:
-        raise SyntheticDataGenerationError(
-            "synthetic_generation_count_mismatch",
-            "The generator did not return the exact requested record count.",
-            details=[{"requested_count": request.count, "generated_count": len(records), "target_table": request.target_table}],
-        )
-    supported = [name for name in _rif_get_public_table_names() if name not in _rif_operational_tables]
-    metadata = {
-        "generator": "faker",
-        "generator_mode": "registered_profile" if profile is not None else "schema_fallback_reflected_postgresql",
-        "synthetic_data_only": True,
-        "faker_locale": DEFAULT_FAKER_LOCALE,
-        "batch_id": batch_id,
-        "requested_record_count": request.count,
-        "generated_record_count": len(records),
-        "target_table": request.target_table,
-        "constraints": request.constraints,
-        "supported_tables": supported,
-        "foreign_keys_use_existing_parent_rows": True,
-        "confirmation_required": True,
-        "schema_source": "postgresql_reflection",
-    }
-    return SyntheticDataBatch(target_table=request.target_table, records=records, metadata=metadata)
-
-
-def supported_synthetic_tables() -> list[dict[str, Any]]:  # type: ignore[override]
-    return [
-        {
-            "table_name": table_name,
             "generator_mode": "registered_profile" if table_name in PROFILE_REGISTRY else "schema_fallback_reflected_postgresql",
             "schema_source": "postgresql_reflection",
         }
-        for table_name in _rif_get_public_table_names()
-        if table_name not in _rif_operational_tables
+        for table_name in _synthetic_table_names()
     ]
-# END RIF FULL PGSQL SYNTHETIC OVERRIDE

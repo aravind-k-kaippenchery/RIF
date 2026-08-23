@@ -1,8 +1,0 @@
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-  "editor.formatOnSave": true,
-  "files.exclude": {
-    "**/__pycache__": true,
-    "**/.pytest_cache": true
-  }
-}

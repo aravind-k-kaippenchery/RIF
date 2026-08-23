@@ -113,6 +113,7 @@ def frontend_query(
             route=resolution.route.value,
             status=resolution.status.value,
             data=resolution_data,
+            generated_sql=None,
         )
         memory_audit = write_agent_memory_event(
             db,
@@ -179,6 +180,7 @@ def frontend_query(
         route=result.route.value,
         status=result.status.value,
         data=result.data,
+        generated_sql=result.generated_sql,
     )
     memory_audit = write_agent_memory_event(
         db,

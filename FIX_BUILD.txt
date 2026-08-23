@@ -1,0 +1,16 @@
+Build: 2026-08-03-sensitive-credential-guard-v3
+
+This cumulative build includes the previous aggregation, count-answer,
+salary-routing, local-admin, and conversational-memory fixes.
+
+Additional session-continuity fix:
+- The frontend keeps the active chat UUID in an immediately updated reference.
+- Every follow-up request reuses that UUID, with sessionStorage as a fallback.
+- Expired sessions clear both state and the immediate reference before retrying.
+
+Expected same-chat test:
+1. Show employees from Bangalore.
+2. How many are there?
+
+The second response must count the Bangalore result. A new chat with no prior
+table result must still ask for clarification.

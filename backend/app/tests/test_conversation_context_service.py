@@ -211,12 +211,136 @@ def test_conversation_reference_links_query_log_to_pending_action():
     )
 
     assert reference == {
+        "reference_type": "action",
         "pending_action_id": "08ef1073-b9cf-40ad-a5bb-08ed91e8a961",
         "target_table": "employees",
         "record_count": 10,
         "route": "crud_write",
         "status": "pending_confirmation",
     }
+
+
+def test_conversation_reference_preserves_reflected_read_context_without_rows():
+    reference = conversation_reference_from_result(
+        pending_action_id=None,
+        route="structured_read",
+        status="success",
+        data={
+            "target_table": "employees",
+            "row_count": 19,
+            "applied_filters": {"city": "bangalore"},
+            "rows": [{"employee_id": 1, "email": "must-not-be-stored@example.test"}],
+        },
+    )
+
+    assert reference == {
+        "reference_type": "table_result",
+        "pending_action_id": None,
+        "target_table": "employees",
+        "filters": {"city": "bangalore"},
+        "filters_complete": True,
+        "relationship_filter": {},
+        "record_count": 19,
+        "route": "structured_read",
+        "status": "success",
+    }
+    assert "rows" not in reference
+
+
+def test_schema_table_result_is_available_for_live_pronoun_resolution():
+    reference = conversation_reference_from_result(
+        pending_action_id=None,
+        route="system",
+        status="success",
+        data={
+            "schema_metadata": {
+                "kind": "table_exists",
+                "canonical_table": "orders",
+                "table_name": "orders",
+                "exists": True,
+                "source": "live_postgresql_metadata",
+            }
+        },
+    )
+
+    assert reference == {
+        "reference_type": "table_metadata",
+        "pending_action_id": None,
+        "target_table": "orders",
+        "filters": {},
+        "filters_complete": True,
+        "relationship_filter": {},
+        "record_count": None,
+        "route": "system",
+        "status": "success",
+    }
+
+
+def test_synthetic_target_clarification_contract_is_persisted_without_rows():
+    reference = conversation_reference_from_result(
+        pending_action_id=None,
+        route="system",
+        status="clarification_required",
+        data={
+            "clarification": {
+                "code": "synthetic_target_table_required",
+                "missing_fields": ["target_table"],
+                "resolved_tables": [],
+                "detected_intent": "synthetic_generation",
+            }
+        },
+    )
+
+    assert reference == {
+        "reference_type": "clarification",
+        "clarification_code": "synthetic_target_table_required",
+        "missing_fields": ["target_table"],
+        "resolved_tables": [],
+        "detected_intent": "synthetic_generation",
+        "target_table": None,
+        "route": "system",
+        "status": "clarification_required",
+    }
+
+
+def test_generated_read_memory_uses_sql_ast_and_live_columns(monkeypatch):
+    from app.services import conversation_context_service
+
+    monkeypatch.setattr(
+        conversation_context_service,
+        "get_runtime_columns",
+        lambda table: ["employee_id", "city", "employment_status"] if table == "employees" else [],
+    )
+    reference = conversation_reference_from_result(
+        pending_action_id=None,
+        route="structured_read",
+        status="success",
+        data={
+            "row_count": 19,
+            "database_source": {"source_type": "database", "tables": ["employees"]},
+        },
+        generated_sql="SELECT * FROM employees WHERE lower(city) = 'bangalore' LIMIT 50",
+    )
+    assert reference is not None
+    assert reference["target_table"] == "employees"
+    assert reference["filters"] == {"city": "bangalore"}
+    assert reference["filters_complete"] is True
+
+
+def test_range_filter_is_not_silently_replayed_as_an_unfiltered_query(monkeypatch):
+    from app.services import conversation_context_service
+
+    monkeypatch.setattr(conversation_context_service, "get_runtime_columns", lambda _table: ["product_id", "list_price"])
+    reference = conversation_reference_from_result(
+        pending_action_id=None,
+        route="structured_read",
+        status="success",
+        data={"row_count": 3, "database_source": {"tables": ["products"]}},
+        generated_sql="SELECT * FROM products WHERE list_price > 500 LIMIT 50",
+    )
+    assert reference is not None
+    assert reference["filters"] == {}
+    assert reference["filters_complete"] is False
 
 
 def test_frontend_query_short_circuits_ollama_for_can_i_see_it():

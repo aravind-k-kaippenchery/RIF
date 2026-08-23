@@ -28,7 +28,6 @@ class Settings(BaseSettings):
     app_debug: bool = False
     log_level: str = "INFO"
     cors_origins: str = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:5500"
-
     # PostgreSQL was connected in Phase 2.
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)

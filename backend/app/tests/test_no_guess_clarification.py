@@ -4,6 +4,7 @@ import pytest
 
 from app.agents.orchestrator import agent_orchestrator
 from app.core.constants import AgentRoute, ResponseStatus, UserRole
+from app.services import request_clarification_service as clarification_service
 from app.services.request_clarification_service import (
     analyze_request_clarity,
     assert_generated_tables_match,
@@ -59,6 +60,34 @@ def test_explicit_update_and_delete_are_allowed():
 def test_table_resolution_never_injects_employees():
     assert resolve_business_tables("add 5 synthetic data") == ()
     assert resolve_business_tables("show customers in Kochi") == ("customers",)
+
+
+def test_newly_reflected_table_is_accepted_for_synthetic_generation(monkeypatch):
+    monkeypatch.setattr(
+        clarification_service,
+        "get_public_table_names",
+        lambda: ["employees", "demo_orders", "query_logs"],
+    )
+    decision = analyze_request_clarity("Generate 5 synthetic rows for demo_orders table")
+    assert decision.needs_clarification is False
+    assert decision.detected_intent == "synthetic_generation"
+    assert decision.resolved_tables == ("demo_orders",)
+
+    short_alias_decision = analyze_request_clarity("Add 5 synthetic records to orders table")
+    assert short_alias_decision.needs_clarification is False
+    assert short_alias_decision.resolved_tables == ("demo_orders",)
+
+
+def test_dynamic_table_is_shown_in_available_synthetic_targets(monkeypatch):
+    monkeypatch.setattr(
+        clarification_service,
+        "get_public_table_names",
+        lambda: ["employees", "demo_orders", "query_logs"],
+    )
+    decision = analyze_request_clarity("Generate 5 synthetic rows")
+    assert decision.needs_clarification is True
+    assert "demo_orders" in decision.message
+    assert "query_logs" not in decision.message
 
 
 def test_generated_table_alignment_rejects_wrong_model_target():

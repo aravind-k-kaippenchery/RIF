@@ -1,6 +1,11 @@
 from app.agents.router import classify_question
 from app.core.constants import AgentRoute
-from app.services.demo_question_service import detect_demo_question
+from app.services import demo_question_service
+from app.services.demo_question_service import (
+    _apply_context_status_filter,
+    _latest_table_context_from_memory,
+    detect_demo_question,
+)
 from app.services.request_clarification_service import analyze_request_clarity
 from app.services.conversation_context_service import resolve_followup_from_state
 
@@ -11,6 +16,83 @@ def test_second_followup_active_ones_is_context_demo_question():
     assert request.kind == "context_followup_list"
     assert request.table == "__memory__"
     assert request.filters["status_value"] == "active"
+
+
+def test_reflected_read_context_is_recovered_without_generated_sql():
+    context = {
+        "available": True,
+        "events": [
+            {
+                "prior_question": "Show employees from Bangalore.",
+                "route": "structured_read",
+                "status": "success",
+                "generated_sql": None,
+                "conversation_reference": {
+                    "reference_type": "table_result",
+                    "target_table": "employees",
+                    "filters": {"city": "bangalore"},
+                    "record_count": 19,
+                },
+            }
+        ],
+    }
+
+    recovered = _latest_table_context_from_memory(context)
+    assert recovered is not None
+    assert recovered["table"] == "employees"
+    assert recovered["filters"] == {"city": "bangalore"}
+    assert recovered["reference_type"] == "table_result"
+
+
+def test_active_followup_preserves_old_filter_and_uses_live_status_column(monkeypatch):
+    monkeypatch.setattr(
+        demo_question_service,
+        "get_runtime_columns",
+        lambda _table: ["employee_id", "city", "employment_status"],
+    )
+    filters = _apply_context_status_filter(
+        "employees",
+        {"city": "bangalore"},
+        "active",
+    )
+    assert filters == {"city": "bangalore", "employment_status": "active"}
+
+
+def test_ambiguous_live_status_columns_are_not_guessed(monkeypatch):
+    monkeypatch.setattr(
+        demo_question_service,
+        "get_runtime_columns",
+        lambda _table: ["order_status", "payment_status"],
+    )
+    assert _apply_context_status_filter("orders", {}, "active") is None
+
+
+def test_status_followup_uses_arbitrary_reflected_table_column(monkeypatch):
+    monkeypatch.setattr(
+        demo_question_service,
+        "get_runtime_columns",
+        lambda _table: ["failed_order_id", "order_status"],
+    )
+    assert _apply_context_status_filter("failed_orders", {"city": "kochi"}, "active") == {
+        "city": "kochi",
+        "order_status": "active",
+    }
+
+
+def test_legacy_question_text_is_not_used_as_a_hardcoded_table_fallback():
+    context = {
+        "available": True,
+        "events": [
+            {
+                "prior_question": "Show employees from Bangalore.",
+                "route": "structured_read",
+                "status": "success",
+                "generated_sql": None,
+                "conversation_reference": None,
+            }
+        ],
+    }
+    assert _latest_table_context_from_memory(context) is None
 
 
 def test_first_three_followup_is_context_demo_question():

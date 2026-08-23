@@ -102,6 +102,7 @@ class AgentState(TypedDict, total=False):
     table_record_request: dict[str, Any] | None
     demo_question_request: dict[str, Any] | None
     parent_child_request: bool
+    blocked_response_status: str | None
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,45 @@ class AgentOrchestrator:
         return bool(re.search(r"\b(?:drop|truncate|alter)\s+(?:table\s+)?[a-z][a-z0-9_]*\b", str(question or "").casefold()))
 
     @staticmethod
+    def _looks_like_sensitive_credential_request(question: str) -> bool:
+        """Block requests to retrieve authentication secrets before any data route.
+
+        Policy/explanation questions remain available, while requests that ask the
+        assistant to reveal, list, show, export, find, or otherwise obtain a secret
+        are rejected without calling Ollama or touching PostgreSQL.
+        """
+
+        normalized = " ".join(str(question or "").casefold().split())
+        if not normalized:
+            return False
+
+        credential = re.search(
+            r"\b(?:passwords?|passcodes?|private\s+keys?|secret\s+keys?|api[\s_-]*keys?|"
+            r"access[\s_-]*tokens?|refresh[\s_-]*tokens?|auth(?:entication)?[\s_-]*tokens?|"
+            r"secrets?|otps?|one[\s_-]*time\s+passwords?|pins?|cvvs?)\b",
+            normalized,
+        )
+        if not credential:
+            return False
+
+        policy_only = re.search(
+            r"\b(?:policy|policies|best\s+practices?|how\s+should|why\s+should|"
+            r"is\s+it\s+safe|explain|definition|define|protect|hash|encrypt|rotate)\b",
+            normalized,
+        )
+        disclosure = re.search(
+            r"\b(?:give|show|list|display|reveal|retrieve|return|export|print|tell|find|"
+            r"read|fetch|provide|send|dump|what\s+is|what\s+are|get|access)\b",
+            normalized,
+        )
+        data_subject = re.search(
+            r"\b(?:employees?|users?|customers?|vendors?|accounts?|database|table|records?|"
+            r"every|all|their|his|her|my)\b",
+            normalized,
+        )
+        return bool(disclosure and (data_subject or not policy_only))
+
+    @staticmethod
     def _append_trace(state: AgentState, node: str, detail: str) -> list[dict[str, Any]]:
         """Return a new graph_trace list with one more entry appended.
 
@@ -157,6 +197,28 @@ class AgentOrchestrator:
         return existing
 
     def _classify(self, state: AgentState) -> dict[str, Any]:
+        if self._looks_like_sensitive_credential_request(state["question"]):
+            return {
+                "route": AgentRoute.SYSTEM.value,
+                "route_confidence": 1.0,
+                "routing_reason": "A request to retrieve authentication credentials was blocked before normal intent routing.",
+                "clarification_code": "sensitive_credentials_blocked",
+                "clarification_message": (
+                    "I can’t provide passwords or other authentication credentials. "
+                    "Passwords, private keys, API keys, tokens, OTPs, and PINs must never be retrieved or exposed, even to administrators."
+                ),
+                "clarification_missing_fields": [],
+                "clarification_details": [{"blocked_before_ollama": True, "database_touched": False}],
+                "blocked_response_status": ResponseStatus.SENSITIVE_DATA_BLOCKED.value,
+                "resolved_tables": [],
+                "detected_intent": "sensitive_credential_disclosure",
+                "graph_trace": self._append_trace(
+                    state,
+                    "sensitive_data_guard",
+                    "Blocked credential disclosure before Ollama, SQL generation, or database access.",
+                ),
+            }
+
         schema_request = detect_schema_metadata_question(state["question"])
         if schema_request.handled:
             return {
@@ -207,6 +269,42 @@ class AgentOrchestrator:
                 "resolved_tables": [inferred_table],
                 "detected_intent": "soft_readonly_business_table",
                 "graph_trace": self._append_trace(state, "soft_readonly_table_inference", f"Inferred {inferred_table} for a read-only personnel question."),
+            }
+
+        # Prefer the reflected deterministic path for explicit or natural equality filters.
+        # This prevents older table-specific demo shortcuts from recognizing a table
+        # while silently dropping a filter they do not know about.
+        reflected_filter_request = detect_table_record_question(state["question"])
+        if reflected_filter_request.handled and reflected_filter_request.mode in {"filter", "related"}:
+            if reflected_filter_request.needs_clarification:
+                return {
+                    "route": AgentRoute.SYSTEM.value,
+                    "route_confidence": 1.0,
+                    "routing_reason": "The requested filter or relationship was checked against live PostgreSQL reflection and needs clarification.",
+                    "clarification_code": "reflected_table_filter_invalid",
+                    "clarification_message": reflected_filter_request.clarification_message,
+                    "clarification_missing_fields": ["valid_filter"],
+                    "clarification_details": [],
+                    "resolved_tables": [reflected_filter_request.canonical_table] if reflected_filter_request.canonical_table else [],
+                    "detected_intent": "reflected_table_filter",
+                    "graph_trace": self._append_trace(
+                        state,
+                        "reflected_table_filter_guard",
+                        "Validated an explicit equality filter against live PostgreSQL columns and requested clarification before reading rows.",
+                    ),
+                }
+            return {
+                "route": AgentRoute.STRUCTURED_READ.value,
+                "route_confidence": 1.0,
+                "routing_reason": "The table, filter, and direct relationship were resolved from live PostgreSQL reflection and will use the bounded MCP reader.",
+                "table_record_request": reflected_filter_request.to_state(),
+                "resolved_tables": [reflected_filter_request.canonical_table] if reflected_filter_request.canonical_table else [],
+                "detected_intent": "reflected_table_filter",
+                "graph_trace": self._append_trace(
+                    state,
+                    "reflected_table_filter_guard",
+                    "Resolved a live reflected-column filter; Ollama and hardcoded table filters were bypassed.",
+                ),
             }
 
         demo_request = detect_demo_question(state["question"])
@@ -410,6 +508,9 @@ class AgentOrchestrator:
             needs_clarification=bool(request_data.get("needs_clarification")),
             clarification_message=request_data.get("clarification_message"),
             limit=int(request_data.get("limit") or 50),
+            mode=str(request_data.get("mode") or "browse"),
+            filters=dict(request_data.get("filters") or {}),
+            relationship_filter=dict(request_data.get("relationship_filter") or {}),
         )
         try:
             role = UserRole(str(state.get("user_role") or UserRole.NORMAL_USER.value))
@@ -448,7 +549,7 @@ class AgentOrchestrator:
     def _clarification(self, state: AgentState) -> dict[str, Any]:
         return {
             "route": AgentRoute.SYSTEM.value,
-            "status": ResponseStatus.CLARIFICATION_REQUIRED.value,
+            "status": state.get("blocked_response_status") or ResponseStatus.CLARIFICATION_REQUIRED.value,
             "answer": state.get("clarification_message") or "Please clarify the request.",
             "generated_sql": None,
             "pending_action_id": None,

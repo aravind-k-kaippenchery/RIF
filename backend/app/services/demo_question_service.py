@@ -19,10 +19,16 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.core.constants import AgentRoute, ResponseStatus
+from app.core.constants import AgentRoute, ResponseStatus, UserRole
 from app.models.business import Customer, Employee, Product, SalesDeal, Vendor
 from app.models.operations import QueryLog
-from app.services.schema_registry import BUSINESS_TABLES, OPERATIONAL_TABLES
+from app.services.dynamic_pgsql_schema import get_runtime_columns, get_runtime_table, has_public_table
+from app.services.schema_registry import OPERATIONAL_TABLES, get_schema_contract
+from app.services.table_record_question_service import (
+    TableRecordQuestion,
+    TableRecordQuestionError,
+    read_table_records,
+)
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,14 @@ def _price_threshold(text: str) -> float | None:
     return float(match.group(1))
 
 
+def _salary_threshold(text: str) -> float | None:
+    match = re.search(
+        r"\b(?:salary|pay)\s+(?:is\s+)?(?:greater\s+than|above|over|more\s+than|>)\s+(\d+(?:\.\d+)?)",
+        text,
+    )
+    return float(match.group(1)) if match else None
+
+
 def detect_demo_question(question: str) -> DemoQuestionRequest:
     """Detect high-confidence read-only demo questions.
 
@@ -218,7 +232,13 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
     # These prompts intentionally contain no table name because they refer to the
     # previous successful read in the same session, e.g. "Show only the active ones"
     # after "Show employees from Bangalore".
-    if re.search(r"\b(?:them|those|these|ones|they|there)\b", text):
+    explicit_entity = re.search(
+        r"\b(?:employees?|workers?|staff|people|vendors?|suppliers?|customers?|clients?|products?|items?|orders?|sales\s+deals?|deals?|opportunities)\b",
+        text,
+    )
+    referential_followup = re.search(r"\b(?:them|those|these|ones|they)\b", text)
+    existential_followup = re.search(r"\bthere\b", text) and not explicit_entity
+    if referential_followup or existential_followup:
         if re.search(r"\bhow\s+many\s+(?:are\s+there|of\s+them|of\s+those|of\s+these)?\b", text) and not _department_from_question(text):
             return DemoQuestionRequest(True, kind="context_followup_count", table="__memory__", filters={"followup": True})
         if re.search(r"\b(?:show|list|display|view|get)\b", text) and re.search(r"\b(?:active|inactive)\b", text):
@@ -247,8 +267,11 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
                 filters={"department": department, "followup": True},
             )
 
-    # Sales/orders phrasing. The POC schema uses sales_deals, not an orders table.
+    # Preserve the legacy order-style demo only when PostgreSQL truly has no orders
+    # table. An exact reflected table name always wins over a compatibility alias.
     if re.search(r"\b(?:orders?|recent\s+orders?|orders?\s+placed)\b", text):
+        if has_public_table("orders"):
+            return DemoQuestionRequest(False)
         return DemoQuestionRequest(
             True,
             kind="recent_sales_deals_alias_orders",
@@ -268,8 +291,20 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
 
     # Employees / workers / staff.
     if re.search(r"\b(?:employees?|workers?|staff|people)\b", text):
-        if re.search(r"\bcount\s+employees?\s+by\s+department\b", text):
-            return DemoQuestionRequest(True, kind="employee_count_by_department", table="employees")
+        employee_grouping = re.search(
+            r"\b(?:group|count|break(?:down)?|distribution)\b.*\b(?:by|per|each|department[- ]?wise|city[- ]?wise|location[- ]?wise|status[- ]?wise)\b",
+            text,
+        ) or re.search(
+            r"\b(?:(?:each|every)\s+(?:department|city|location|status)|(?:department|city|location|status)[- ]?wise)\b.*\bcount\b",
+            text,
+        )
+        if employee_grouping:
+            if re.search(r"\b(?:city|location)(?:[- ]?wise)?\b", text):
+                return DemoQuestionRequest(True, kind="employee_count_by_city", table="employees")
+            if re.search(r"\b(?:employment\s+)?status(?:[- ]?wise)?\b", text):
+                return DemoQuestionRequest(True, kind="employee_count_by_status", table="employees")
+            if re.search(r"\bdepartment(?:[- ]?wise)?\b", text):
+                return DemoQuestionRequest(True, kind="employee_count_by_department", table="employees")
         if re.search(r"\bhow\s+many\s+employees?\b", text):
             filters: dict[str, Any] = {}
             department = _department_from_question(text)
@@ -284,6 +319,9 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
                 filters["employment_status"] = "inactive"
             return DemoQuestionRequest(True, kind="employee_count", table="employees", filters=filters)
 
+        if re.search(r"\b(?:average|avg|mean)\b.*\b(?:salary|pay)\b|\b(?:salary|pay)\b.*\b(?:average|avg|mean)\b", text):
+            return DemoQuestionRequest(True, kind="employee_average_salary", table="employees")
+
         filters = {}
         department = _department_from_question(text)
         city = _city_from_question(text)
@@ -294,12 +332,20 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
             filters["city"] = city
         if name_like:
             filters["name_contains"] = name_like
+        salary_threshold = _salary_threshold(text)
+        if salary_threshold is not None:
+            filters["salary_gt"] = salary_threshold
         if "active" in text:
             filters["employment_status"] = "active"
         if "inactive" in text:
             filters["employment_status"] = "inactive"
         if re.search(r"\b(?:show|list|view|display|find|who|which|get)\b", text):
-            return DemoQuestionRequest(True, kind="employee_list", table="employees", filters=filters, limit=_limit_from_question(text))
+            highest_paid = bool(
+                re.search(r"\b(?:highest|top|most)\s*[- ]?(?:paid|salary|pay)\b", text)
+                or re.search(r"\b(?:salary|pay)\b.*\b(?:highest|descending|highest\s+to\s+lowest)\b", text)
+            )
+            kind = "employee_list_by_salary_desc" if highest_paid else "employee_list"
+            return DemoQuestionRequest(True, kind=kind, table="employees", filters=filters, limit=_limit_from_question(text))
 
     # Natural wording: "Who works under Finance?" / "Who works in Finance?"
     if re.search(r"\bwho\s+works\b", text):
@@ -323,6 +369,11 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
         name_like = _vendor_name_contains(text)
         if name_like:
             filters["vendor_name_contains"] = name_like
+        if name_like is None and re.search(r"\b(?:where|whose|from|in|at|city)\b", text):
+            # Do not let the legacy vendor demo shortcut discard a condition it
+            # cannot represent. The reflected filter path or validated NL-to-SQL
+            # path must handle it instead of returning every vendor.
+            return DemoQuestionRequest(False)
         return DemoQuestionRequest(True, kind="vendor_list", table="vendors", filters=filters, limit=_limit_from_question(text))
 
     # Customers / clients.
@@ -347,6 +398,11 @@ def detect_demo_question(question: str) -> DemoQuestionRequest:
             filters["is_active"] = True
         if "inactive" in text:
             filters["is_active"] = False
+        if threshold is None and re.search(r"\b(?:where|whose|from|in|with|having|category)\b", text):
+            # Never return every product after recognizing but discarding an
+            # unsupported condition. Reflected filtering or validated NL-to-SQL
+            # owns these prompts.
+            return DemoQuestionRequest(False)
         return DemoQuestionRequest(True, kind="product_list", table="products", filters=filters, limit=_limit_from_question(text))
 
     return DemoQuestionRequest(False)
@@ -402,6 +458,8 @@ def _sql_where(filters: dict[str, Any]) -> str:
             parts.append(f"lower({column}) LIKE '%{str(value).lower()}%'")
         elif key == "list_price_gt":
             parts.append(f"list_price > {value}")
+        elif key == "salary_gt":
+            parts.append(f"salary > {value}")
         elif key == "is_active":
             parts.append(f"is_active = {str(bool(value)).lower()}")
         else:
@@ -429,22 +487,11 @@ def _latest_employee_city_from_memory(memory_context: dict[str, Any] | None) -> 
     return None
 
 
-_TABLE_MODEL_BY_NAME = {
-    "employees": Employee,
-    "vendors": Vendor,
-    "customers": Customer,
-    "products": Product,
-    "sales_deals": SalesDeal,
-}
-
-
 def _latest_table_context_from_memory(memory_context: dict[str, Any] | None) -> dict[str, Any] | None:
     """Recover the latest explicit table/filter context for short follow-ups.
 
-    The stored memory deliberately contains only bounded query metadata, not hidden
-    reasoning.  We parse the last successful generated SELECT/question to preserve
-    concrete filters across more than one follow-up while still refusing to guess when
-    no table can be recovered.
+    The stored memory contains only a reflected table, replayable equality filters,
+    and a row count. Returned business rows and hidden reasoning are never retained.
     """
 
     if not isinstance(memory_context, dict):
@@ -458,70 +505,63 @@ def _latest_table_context_from_memory(memory_context: dict[str, Any] | None) -> 
             continue
         if str(event.get("status") or "").lower() not in {"success", "pending_confirmation"}:
             continue
-        sql = str(event.get("generated_sql") or "")
-        question = _normalize(str(event.get("prior_question") or event.get("user_prompt") or ""))
-        candidate = f"{sql} {question}".lower()
-        table: str | None = None
-        for table_name in ("employee_experiences", "employees", "vendors", "customers", "products", "sales_deals"):
-            spaced = table_name.replace("_", " ")
-            if re.search(rf"\bfrom\s+{re.escape(table_name)}\b", candidate) or re.search(rf"\b{re.escape(spaced)}\b", candidate):
-                table = table_name
-                break
-        if table is None:
-            if re.search(r"\b(?:workers?|employees?|staff)\b", question):
-                table = "employees"
-            elif re.search(r"\bvendors?\b", question):
-                table = "vendors"
-            elif re.search(r"\bcustomers?\b", question):
-                table = "customers"
-            elif re.search(r"\bproducts?\b", question):
-                table = "products"
-            elif re.search(r"\b(?:sales\s+deals?|deals?)\b", question):
-                table = "sales_deals"
-        if table is None or table == "employee_experiences":
-            continue
-
-        filters: dict[str, Any] = {}
-        if table == "employees":
-            for key, label in _KNOWN_CITIES.items():
-                if re.search(rf"\b{re.escape(key)}\b", candidate):
-                    filters["city"] = label
-                    break
-            dept = _department_from_question(candidate)
-            if dept:
-                filters["department"] = dept
-            if re.search(r"\bemployment_status\s*=\s*'inactive'\b|\binactive\b", candidate):
-                filters["employment_status"] = "inactive"
-            elif re.search(r"\bemployment_status\s*=\s*'active'\b|\bactive\b", candidate):
-                filters["employment_status"] = "active"
-        elif table in {"vendors", "customers"}:
-            if re.search(r"\bstatus\s*=\s*'inactive'\b|\binactive\b", candidate):
-                filters["status"] = "inactive"
-            elif re.search(r"\bstatus\s*=\s*'active'\b|\bapproved\b|\bactive\b", candidate):
-                filters["status"] = "active"
-        elif table == "products":
-            price_match = re.search(r"\blist_price\s*>\s*(\d+(?:\.\d+)?)", candidate)
-            if price_match:
-                filters["list_price_gt"] = float(price_match.group(1))
-            if re.search(r"\bis_active\s*=\s*false\b|\binactive\b", candidate):
-                filters["is_active"] = False
-            elif re.search(r"\bis_active\s*=\s*true\b|\bactive\b", candidate):
-                filters["is_active"] = True
-        return {"table": table, "filters": filters, "source_question": question, "source_sql": sql}
+        reference = event.get("conversation_reference")
+        if isinstance(reference, dict) and reference.get("reference_type") == "table_result":
+            referenced_table = str(reference.get("target_table") or "").strip().lower()
+            referenced_filters = reference.get("filters")
+            if referenced_table:
+                return {
+                    "table": referenced_table,
+                    "filters": dict(referenced_filters) if isinstance(referenced_filters, dict) else {},
+                    "relationship_filter": (
+                        dict(reference.get("relationship_filter"))
+                        if isinstance(reference.get("relationship_filter"), dict)
+                        else {}
+                    ),
+                    "source_question": _normalize(
+                        str(event.get("prior_question") or event.get("user_prompt") or "")
+                    ),
+                    "source_sql": str(event.get("generated_sql") or ""),
+                    "reference_type": "table_result",
+                    "record_count": reference.get("record_count"),
+                    "filters_complete": bool(reference.get("filters_complete", True)),
+                }
     return None
 
 
-def _apply_context_status_filter(table: str, filters: dict[str, Any], status_value: str | None) -> dict[str, Any]:
+def _apply_context_status_filter(table: str, filters: dict[str, Any], status_value: str | None) -> dict[str, Any] | None:
     updated = dict(filters)
     if not status_value:
         return updated
-    if table == "employees":
-        updated["employment_status"] = status_value
-    elif table in {"vendors", "customers"}:
-        updated["status"] = status_value
-    elif table == "products":
-        updated["is_active"] = status_value == "active"
-    return updated
+    columns = get_runtime_columns(table)
+    status_columns = [column for column in columns if column == "status" or column.endswith("_status")]
+    boolean_active_columns = [column for column in columns if column == "is_active" or column.endswith("_active")]
+    candidates = status_columns + boolean_active_columns
+    if len(candidates) == 1:
+        selected = candidates[0]
+        updated[selected] = status_value == "active" if selected in boolean_active_columns else status_value
+        return updated
+
+    return None
+
+
+def _live_equality_conditions(table: Any, filters: dict[str, Any]) -> list[Any] | None:
+    conditions: list[Any] = []
+    for column_name, value in filters.items():
+        column = table.c.get(str(column_name).strip().lower())
+        if column is None:
+            return None
+        try:
+            python_type = column.type.python_type
+        except (AttributeError, NotImplementedError):
+            python_type = None
+        if value is None:
+            conditions.append(column.is_(None))
+        elif python_type is str:
+            conditions.append(func.lower(column) == str(value).casefold())
+        else:
+            conditions.append(column == value)
+    return conditions
 
 
 def _execute_context_followup(db: Session, request: DemoQuestionRequest, memory_context: dict[str, Any] | None) -> DemoQuestionResult:
@@ -537,79 +577,96 @@ def _execute_context_followup(db: Session, request: DemoQuestionRequest, memory_
         )
 
     table = str(context["table"])
-    filters = _apply_context_status_filter(table, dict(context.get("filters") or {}), dict(request.filters or {}).get("status_value"))
+    if not bool(context.get("filters_complete", True)):
+        return DemoQuestionResult(
+            AgentRoute.SYSTEM,
+            ResponseStatus.CLARIFICATION_REQUIRED,
+            "The previous query used joins, ranges, or another condition that cannot be replayed as safe equality filters. Please restate the table and filters explicitly.",
+            {"target_table": table, "rows": [], "filters": {}, "source_context": context},
+            [],
+            None,
+        )
+    status_value = dict(request.filters or {}).get("status_value")
+    filters = _apply_context_status_filter(table, dict(context.get("filters") or {}), status_value)
+    if filters is None:
+        return DemoQuestionResult(
+            AgentRoute.SYSTEM,
+            ResponseStatus.CLARIFICATION_REQUIRED,
+            "The previous table has no single unambiguous status column. Please name the status column explicitly.",
+            {"target_table": table, "rows": [], "filters": {}, "source_context": context},
+            [],
+            None,
+        )
     limit = max(1, min(100, request.limit))
 
-    if request.kind == "context_followup_count":
-        model = _TABLE_MODEL_BY_NAME.get(table)
-        if model is None:
-            return DemoQuestionResult(AgentRoute.SYSTEM, ResponseStatus.CLARIFICATION_REQUIRED, "I cannot count that previous result safely. Please name the table explicitly.", {"target_table": table, "rows": [], "filters": filters}, [], None)
-        count_query = select(func.count()).select_from(model)
-        conditions = _conditions_for_table(table, filters)
-        if conditions:
-            count_query = count_query.where(and_(*conditions))
-        count = int(db.scalar(count_query) or 0)
-        label = table.replace("_", " ")
+    if request.kind != "context_followup_distinct_city":
+        mode = "count" if request.kind == "context_followup_count" else "filter"
+        try:
+            reflected = read_table_records(
+                request=TableRecordQuestion(
+                    True,
+                    canonical_table=table,
+                    limit=1 if mode == "count" else limit,
+                    mode=mode,
+                    filters=filters,
+                    relationship_filter=dict(context.get("relationship_filter") or {}),
+                ),
+                user_role=UserRole.NORMAL_USER,
+            )
+        except TableRecordQuestionError as exc:
+            return DemoQuestionResult(
+                AgentRoute.SYSTEM,
+                ResponseStatus.INFORMATION_NOT_AVAILABLE,
+                exc.message,
+                {"target_table": table, "rows": [], "filters": filters, "source_context": context},
+                [],
+                None,
+            )
+        reflected_data = dict(reflected.data)
+        reflected_data["filters"] = filters
+        reflected_data["source_context"] = context
+        reflected_data.setdefault("execution", {})["deterministic_followup"] = True
         return DemoQuestionResult(
             AgentRoute.STRUCTURED_READ,
-            ResponseStatus.SUCCESS,
-            f"There {'are' if count != 1 else 'is'} {count} {label} in the previous result context.",
-            {"target_table": table, "row_count": count, "rows": [], "filters": filters, "source_context": context, "execution": {"ollama_called": False, "deterministic_followup": True}},
-            _source(table, "Follow-up resolved from bounded session memory and executed as a deterministic read; no LLM SQL was used."),
-            f"SELECT count(*) FROM {table}" + _sql_where(filters),
+            reflected.status,
+            reflected.answer,
+            reflected_data,
+            _source(table, "Follow-up resolved from bounded session memory and live PostgreSQL reflection; no LLM SQL was used."),
+            None,
         )
 
-    if request.kind == "context_followup_distinct_city" and table == "employees":
-        conditions = _conditions_for_table("employees", filters)
-        city_query = select(Employee.city, func.count()).group_by(Employee.city).order_by(Employee.city)
+    try:
+        reflected_table = get_runtime_table(table, bind=db.bind)
+        city_column = reflected_table.c.get("city")
+        conditions = _live_equality_conditions(reflected_table, filters)
+        if city_column is None or conditions is None:
+            raise KeyError("city")
+        city_query = select(city_column, func.count()).select_from(reflected_table)
         if conditions:
-            city_query = city_query.where(and_(*conditions))
-        data_rows = [{"city": str(city), "employee_count": int(count)} for city, count in db.execute(city_query).all()]
-        text = ", ".join(f"{item['city']}: {item['employee_count']}" for item in data_rows)
+            city_query = city_query.where(*conditions)
+        city_query = city_query.group_by(city_column).order_by(city_column)
+        data_rows = [
+            {"city": _safe(city), "record_count": int(count)}
+            for city, count in db.execute(city_query).all()
+        ]
+    except (KeyError, SQLAlchemyError):
         return DemoQuestionResult(
-            AgentRoute.STRUCTURED_READ,
-            ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            f"The previous employee result is distributed by city as: {text}." if data_rows else "Information not available in the current database.",
-            {"target_table": "employees", "row_count": len(data_rows), "rows": data_rows, "filters": filters, "source_context": context, "execution": {"ollama_called": False, "deterministic_followup": True}},
-            _source("employees", "Follow-up city breakdown resolved from bounded session memory; no LLM SQL was used."),
-            "SELECT city, count(*) FROM employees" + _sql_where(filters) + " GROUP BY city ORDER BY city",
+            AgentRoute.SYSTEM,
+            ResponseStatus.CLARIFICATION_REQUIRED,
+            "The previous reflected table has no safely reusable `city` column. Please name a valid column explicitly.",
+            {"target_table": table, "rows": [], "filters": filters, "source_context": context},
+            [],
+            None,
         )
-
-    next_request = DemoQuestionRequest(True, kind=f"{table.rstrip('s')}_list", table=table, filters=filters, limit=limit)
-    if table == "employees":
-        return _execute_employee_query(db, next_request, memory_context)
-    if table == "vendors":
-        return _execute_vendor_query(db, next_request)
-    if table == "customers":
-        return _execute_customer_query(db, next_request)
-    if table == "products":
-        return _execute_product_query(db, next_request)
-    if table == "sales_deals":
-        return _execute_sales_deals_query(db, next_request)
-    return DemoQuestionResult(AgentRoute.SYSTEM, ResponseStatus.CLARIFICATION_REQUIRED, "I could not safely reuse the previous result. Please name the table explicitly.", {"target_table": table, "rows": [], "filters": filters}, [], None)
-
-
-def _conditions_for_table(table: str, filters: dict[str, Any]) -> list[Any]:
-    conditions: list[Any] = []
-    if table == "employees":
-        if filters.get("department"):
-            conditions.append(func.lower(Employee.department) == str(filters["department"]).lower())
-        if filters.get("city"):
-            conditions.append(func.lower(Employee.city) == str(filters["city"]).lower())
-        if filters.get("employment_status"):
-            conditions.append(func.lower(Employee.employment_status) == str(filters["employment_status"]).lower())
-    elif table == "vendors":
-        if filters.get("status"):
-            conditions.append(func.lower(Vendor.status) == str(filters["status"]).lower())
-    elif table == "customers":
-        if filters.get("status"):
-            conditions.append(func.lower(Customer.status) == str(filters["status"]).lower())
-    elif table == "products":
-        if filters.get("list_price_gt") is not None:
-            conditions.append(Product.list_price > Decimal(str(filters["list_price_gt"])))
-        if "is_active" in filters:
-            conditions.append(Product.is_active.is_(bool(filters["is_active"])))
-    return conditions
+    text = ", ".join(f"{item['city']}: {item['record_count']}" for item in data_rows)
+    return DemoQuestionResult(
+        AgentRoute.STRUCTURED_READ,
+        ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
+        f"The previous `{table.replace('_', ' ')}` result is distributed by city as: {text}." if data_rows else "Information not available in the current database.",
+        {"target_table": table, "row_count": len(data_rows), "rows": data_rows, "filters": filters, "source_context": context, "execution": {"ollama_called": False, "deterministic_followup": True}},
+        _source(table, "Follow-up city breakdown resolved from bounded session memory and live PostgreSQL reflection; no LLM SQL was used."),
+        None,
+    )
 
 
 def _employee_display(row: dict[str, Any]) -> str:
@@ -675,6 +732,8 @@ def _list_answer(*, table: str, rows: list[dict[str, Any]], filters: dict[str, A
         parts.append(f"with status {filters['status']}")
     if filters.get("list_price_gt") is not None:
         parts.append(f"with list price greater than {filters['list_price_gt']:g}")
+    if filters.get("salary_gt") is not None:
+        parts.append(f"with salary greater than {filters['salary_gt']:g}")
     qualifier = " " + " and ".join(parts) if parts else ""
     summaries = [display_map.get(table, lambda item: str(item))(row) for row in rows[:5]]
     prefix = (alias_note + " ") if alias_note else ""
@@ -702,6 +761,8 @@ def _execute_employee_query(db: Session, request: DemoQuestionRequest, memory_co
     if filters.get("name_contains"):
         pattern = f"%{filters['name_contains']}%"
         conditions.append(or_(Employee.first_name.ilike(pattern), Employee.last_name.ilike(pattern), (Employee.first_name + " " + Employee.last_name).ilike(pattern)))
+    if filters.get("salary_gt") is not None:
+        conditions.append(Employee.salary > Decimal(str(filters["salary_gt"])))
     if conditions:
         query = query.where(and_(*conditions))
 
@@ -733,17 +794,46 @@ def _execute_employee_query(db: Session, request: DemoQuestionRequest, memory_co
             data={"target_table": "employees", "row_count": count, "rows": [], "filters": filters, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
         )
 
-    if request.kind == "employee_count_by_department":
-        rows = list(db.execute(select(Employee.department, func.count()).group_by(Employee.department).order_by(Employee.department)).all())
-        data_rows = [{"department": str(dept), "employee_count": int(count)} for dept, count in rows]
-        text = ", ".join(f"{item['department']}: {item['employee_count']}" for item in data_rows)
+    if request.kind == "employee_average_salary":
+        average = db.scalar(select(func.avg(Employee.salary)))
+        if average is None:
+            return DemoQuestionResult(
+                route=AgentRoute.STRUCTURED_READ,
+                status=ResponseStatus.INFORMATION_NOT_AVAILABLE,
+                answer="Information not available in the current database.",
+                generated_sql="SELECT avg(salary) AS average_salary FROM employees",
+                sources=_source("employees"),
+                data={"target_table": "employees", "row_count": 0, "rows": [], "execution": {"ollama_called": False, "deterministic_demo_query": True}},
+            )
+        average_value = float(average)
+        return DemoQuestionResult(
+            route=AgentRoute.STRUCTURED_READ,
+            status=ResponseStatus.SUCCESS,
+            answer=f"The average employee salary is {average_value:,.2f}.",
+            generated_sql="SELECT avg(salary) AS average_salary FROM employees",
+            sources=_source("employees"),
+            data={"target_table": "employees", "row_count": 1, "rows": [{"average_salary": average_value}], "execution": {"ollama_called": False, "deterministic_demo_query": True}},
+        )
+
+    grouping_columns = {
+        "employee_count_by_department": ("department", Employee.department),
+        "employee_count_by_city": ("city", Employee.city),
+        "employee_count_by_status": ("employment_status", Employee.employment_status),
+    }
+    if request.kind in grouping_columns:
+        field_name, column = grouping_columns[request.kind]
+        rows = list(db.execute(select(column, func.count()).group_by(column).order_by(column)).all())
+        data_rows = [{field_name: str(value), "employee_count": int(count)} for value, count in rows]
+        text = ", ".join(f"{item[field_name]}: {item['employee_count']}" for item in data_rows)
+        total = sum(item["employee_count"] for item in data_rows)
+        label = "status" if field_name == "employment_status" else field_name
         return DemoQuestionResult(
             route=AgentRoute.STRUCTURED_READ,
             status=ResponseStatus.SUCCESS if data_rows else ResponseStatus.INFORMATION_NOT_AVAILABLE,
-            answer=f"Employee count by department: {text}." if data_rows else "Information not available in the current database.",
-            generated_sql="SELECT department, count(*) AS employee_count FROM employees GROUP BY department ORDER BY department",
+            answer=f"Employee count by {label}: {text}. Total: {total}." if data_rows else "Information not available in the current database.",
+            generated_sql=f"SELECT {field_name}, count(*) AS employee_count FROM employees GROUP BY {field_name} ORDER BY {field_name}",
             sources=_source("employees"),
-            data={"target_table": "employees", "row_count": len(data_rows), "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
+            data={"target_table": "employees", "row_count": len(data_rows), "employee_total": total, "rows": data_rows, "execution": {"ollama_called": False, "deterministic_demo_query": True}},
         )
 
     total_query = select(func.count()).select_from(Employee)
@@ -751,11 +841,16 @@ def _execute_employee_query(db: Session, request: DemoQuestionRequest, memory_co
         total_query = total_query.where(and_(*conditions))
     total_count = int(db.scalar(total_query) or 0)
     limit = max(1, min(100, request.limit))
-    query = query.order_by(Employee.id).limit(limit)
+    if request.kind == "employee_list_by_salary_desc":
+        query = query.order_by(desc(Employee.salary), Employee.id).limit(limit)
+        order_sql = " ORDER BY salary DESC, id"
+    else:
+        query = query.order_by(Employee.id).limit(limit)
+        order_sql = " ORDER BY id"
     items = list(db.scalars(query).all())
     rows = _rows_from_models(items, ["id", "employee_code", "first_name", "last_name", "email", "department", "city", "company_name", "salary", "employment_status"])
     status, answer = _list_answer(table="employees", rows=rows, filters=filters, total_count=total_count)
-    sql = "SELECT * FROM employees" + _sql_where(filters) + f" ORDER BY id LIMIT {limit}"
+    sql = "SELECT * FROM employees" + _sql_where(filters) + order_sql + f" LIMIT {limit}"
     return DemoQuestionResult(
         route=AgentRoute.STRUCTURED_READ,
         status=status,
@@ -859,13 +954,14 @@ def execute_demo_question(
             )
 
         if request.kind == "business_tables":
+            business_tables = list(get_schema_contract().get("business_tables") or [])
             return DemoQuestionResult(
                 route=AgentRoute.SYSTEM,
                 status=ResponseStatus.SUCCESS,
-                answer="The approved business tables are: " + ", ".join(f"`{item}`" for item in BUSINESS_TABLES) + ".",
+                answer="The available business tables are: " + ", ".join(f"`{item}`" for item in business_tables) + ".",
                 generated_sql=None,
                 sources=[],
-                data={"business_tables": list(BUSINESS_TABLES), "table_count": len(BUSINESS_TABLES), "execution": {"ollama_called": False, "deterministic_demo_query": True}},
+                data={"business_tables": business_tables, "table_count": len(business_tables), "schema_source": "postgresql_reflection", "execution": {"ollama_called": False, "deterministic_demo_query": True}},
             )
 
         if request.kind == "operational_tables":

@@ -10,23 +10,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 
 from app.core.constants import ResponseStatus, UserRole
-from app.models import Base
 from app.models.operations import ActionLog, ChangeSnapshot, PendingAction
 from app.services.duplicate_service import json_safe, row_to_dict
-from app.services.schema_registry import BUSINESS_TABLES
+from app.services.dynamic_pgsql_schema import get_runtime_table
+from app.services.schema_registry import OPERATIONAL_TABLES
 from app.services.session_service import _utc_now, create_pending_action, get_active_session, pending_action_to_dict
 
 
 ROLLBACK_SUPPORTED_ACTIONS = {"update", "delete"}
-MANAGED_UPDATE_COLUMNS = {"id", "created_at", "updated_at"}
 
 
 class AuditRollbackError(RuntimeError):
@@ -125,20 +125,27 @@ class AuditRollbackService:
             )
 
     @staticmethod
-    def _business_table(table_name: str | None):
+    def _business_table(table_name: str | None, db: DbSession | None = None):
         normalized = (table_name or "").strip().lower()
-        if normalized not in BUSINESS_TABLES:
+        if not normalized or normalized in OPERATIONAL_TABLES:
             raise AuditRollbackError(
                 status=ResponseStatus.VALIDATION_FAILED,
                 code="rollback_target_not_allowed",
-                message="Rollback is limited to audited approved business-table writes.",
+                message="Rollback is limited to audited public business-table writes.",
             )
-        table = Base.metadata.tables.get(normalized)
-        if table is None or "id" not in table.c:
+        try:
+            table = get_runtime_table(normalized, bind=db.bind if db is not None else None)
+        except KeyError as exc:
             raise AuditRollbackError(
                 status=ResponseStatus.VALIDATION_FAILED,
                 code="rollback_table_metadata_unavailable",
-                message="The audited rollback target cannot be safely resolved from application metadata.",
+                message="The audited rollback target cannot be safely resolved from PostgreSQL reflection.",
+            ) from exc
+        if not list(table.primary_key.columns):
+            raise AuditRollbackError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="rollback_primary_key_required",
+                message="Safe rollback requires the target table to have a primary key.",
             )
         return table
 
@@ -165,8 +172,49 @@ class AuditRollbackService:
         return [snapshot for snapshot in snapshots if snapshot.snapshot_type == snapshot_type]
 
     @staticmethod
-    def _row_by_id(db: DbSession, table, record_id: Any) -> dict[str, Any] | None:
-        row = db.execute(select(table).where(table.c.id == record_id).limit(1)).mappings().first()
+    def _identity_filter(table, identity: dict[str, Any]):
+        primary_keys = list(table.primary_key.columns)
+        if not primary_keys or not all(column.name in identity for column in primary_keys):
+            raise AuditRollbackError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="rollback_primary_key_missing",
+                message="The audit snapshot does not contain the complete primary key required for rollback.",
+            )
+        return and_(*(column == identity[column.name] for column in primary_keys))
+
+    @staticmethod
+    def _snapshot_identity(table, snapshot: ChangeSnapshot, record: dict[str, Any]) -> dict[str, Any]:
+        primary_keys = list(table.primary_key.columns)
+        identity = {
+            column.name: record[column.name]
+            for column in primary_keys
+            if record.get(column.name) is not None
+        }
+        if len(identity) == len(primary_keys):
+            return identity
+        try:
+            stored = json.loads(str(snapshot.record_id or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored = None
+        if isinstance(stored, dict):
+            identity = {
+                column.name: stored[column.name]
+                for column in primary_keys
+                if stored.get(column.name) is not None
+            }
+        elif len(primary_keys) == 1 and snapshot.record_id not in (None, "", "unknown"):
+            identity = {primary_keys[0].name: snapshot.record_id}
+        if len(identity) != len(primary_keys):
+            raise AuditRollbackError(
+                status=ResponseStatus.INFORMATION_NOT_AVAILABLE,
+                code="rollback_snapshot_primary_key_missing",
+                message="The original snapshot does not contain a complete primary key, so it cannot be rolled back safely.",
+            )
+        return identity
+
+    @classmethod
+    def _row_by_identity(cls, db: DbSession, table, identity: dict[str, Any]) -> dict[str, Any] | None:
+        row = db.execute(select(table).where(cls._identity_filter(table, identity)).limit(1)).mappings().first()
         return row_to_dict(row) if row is not None else None
 
     def _build_plan(self, db: DbSession, action: ActionLog, snapshots: list[ChangeSnapshot]) -> dict[str, Any]:
@@ -184,7 +232,8 @@ class AuditRollbackService:
                 code="rollback_requires_successful_action",
                 message="Only a successful audited write can be rolled back.",
             )
-        table = self._business_table(action.target_table)
+        table = self._business_table(action.target_table, db)
+        primary_key_names = {column.name for column in table.primary_key.columns}
         before = self._snapshot_by_type(snapshots, "before")
         if not before:
             raise AuditRollbackError(
@@ -197,13 +246,9 @@ class AuditRollbackService:
         stale_or_conflicting: list[dict[str, Any]] = []
         for snapshot in before:
             original = dict(snapshot.snapshot_data or {})
-            record_id = original.get("id")
-            if record_id is None:
-                try:
-                    record_id = int(snapshot.record_id)
-                except (TypeError, ValueError):
-                    record_id = snapshot.record_id
-            current = self._row_by_id(db, table, record_id)
+            identity = self._snapshot_identity(table, snapshot, original)
+            record_id: Any = next(iter(identity.values())) if len(identity) == 1 else identity
+            current = self._row_by_identity(db, table, identity)
 
             if action_type == "update":
                 if current is None:
@@ -212,12 +257,15 @@ class AuditRollbackService:
                 restore_values = {
                     name: value
                     for name, value in original.items()
-                    if name in table.c and name not in MANAGED_UPDATE_COLUMNS
+                    if name in table.c
+                    and name not in primary_key_names
+                    and name not in {"created_at", "updated_at"}
                 }
                 operations.append(
                     {
                         "mode": "restore_update",
                         "record_id": record_id,
+                        "primary_key": {name: json_safe(value) for name, value in identity.items()},
                         "restore_values": restore_values,
                         "current_record": current,
                         "original_before_record": original,
@@ -232,6 +280,7 @@ class AuditRollbackService:
                     {
                         "mode": "restore_delete",
                         "record_id": record_id,
+                        "primary_key": {name: json_safe(value) for name, value in identity.items()},
                         "restore_values": insert_values,
                         "current_record": None,
                         "original_before_record": original,
@@ -370,9 +419,15 @@ class AuditRollbackService:
             )
         return action
 
-    @staticmethod
-    def _add_snapshot(db: DbSession, *, action_log_id: int, table_name: str, record: dict[str, Any], snapshot_type: str) -> None:
-        record_id = str(record.get("id") or "unknown")
+    @classmethod
+    def _add_snapshot(cls, db: DbSession, *, action_log_id: int, table_name: str, record: dict[str, Any], snapshot_type: str) -> None:
+        table = cls._business_table(table_name, db)
+        identity = {
+            column.name: json_safe(record[column.name])
+            for column in table.primary_key.columns
+            if record.get(column.name) is not None
+        }
+        record_id = json.dumps(identity, sort_keys=True, default=str)
         db.add(
             ChangeSnapshot(
                 action_log_id=action_log_id,
@@ -453,7 +508,7 @@ class AuditRollbackService:
         original_action, original_snapshots = self._action_with_snapshots(db, original_action_log_id)
         fresh_plan = self._build_plan(db, original_action, original_snapshots)
         target_table = fresh_plan["target_table"]
-        table = self._business_table(target_table)
+        table = self._business_table(target_table, db)
         rollback_log: ActionLog | None = None
         before_rows: list[dict[str, Any]] = []
         after_rows: list[dict[str, Any]] = []
@@ -467,10 +522,10 @@ class AuditRollbackService:
                 original_action_log_id=original_action_log_id,
             )
             for operation in fresh_plan["operations"]:
-                record_id = operation["record_id"]
+                identity = dict(operation.get("primary_key") or {})
                 mode = operation["mode"]
                 if mode == "restore_update":
-                    current = self._row_by_id(db, table, record_id)
+                    current = self._row_by_identity(db, table, identity)
                     if current is None:
                         raise AuditRollbackError(
                             status=ResponseStatus.CLARIFICATION_REQUIRED,
@@ -480,8 +535,8 @@ class AuditRollbackService:
                     before_rows.append(current)
                     self._add_snapshot(db, action_log_id=rollback_log.id, table_name=target_table, record=current, snapshot_type="before")
                     restore_values = dict(operation["restore_values"])
-                    db.execute(table.update().where(table.c.id == record_id).values(**restore_values))
-                    restored = self._row_by_id(db, table, record_id)
+                    db.execute(table.update().where(self._identity_filter(table, identity)).values(**restore_values))
+                    restored = self._row_by_identity(db, table, identity)
                     if restored is None:
                         raise AuditRollbackError(
                             status=ResponseStatus.DATABASE_UNAVAILABLE,
@@ -491,7 +546,7 @@ class AuditRollbackService:
                     after_rows.append(restored)
                     self._add_snapshot(db, action_log_id=rollback_log.id, table_name=target_table, record=restored, snapshot_type="after")
                 elif mode == "restore_delete":
-                    current = self._row_by_id(db, table, record_id)
+                    current = self._row_by_identity(db, table, identity)
                     if current is not None:
                         raise AuditRollbackError(
                             status=ResponseStatus.CLARIFICATION_REQUIRED,
@@ -500,7 +555,7 @@ class AuditRollbackService:
                         )
                     restore_values = dict(operation["restore_values"])
                     db.execute(table.insert().values(**restore_values))
-                    restored = self._row_by_id(db, table, record_id)
+                    restored = self._row_by_identity(db, table, identity)
                     if restored is None:
                         raise AuditRollbackError(
                             status=ResponseStatus.DATABASE_UNAVAILABLE,

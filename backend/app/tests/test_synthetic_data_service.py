@@ -1,13 +1,14 @@
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import Column, DateTime, Integer, MetaData, Numeric, String, Table, create_engine, func
 from sqlalchemy.orm import Session
 
 from app.agents.router import classify_question
 from app.core.constants import AgentRoute
 from app.models import Base, Customer, Employee, Product, Vendor
 from app.models.business import EmployeePermission, ProductVendorMapping, SalesDeal
+from app.services.duplicate_service import find_batch_duplicates
 from app.services.synthetic_data_service import (
     SyntheticDataGenerationError,
     SyntheticDataRequest,
@@ -15,6 +16,7 @@ from app.services.synthetic_data_service import (
     parse_synthetic_data_prompt,
     supported_synthetic_tables,
 )
+import app.services.synthetic_data_service as synthetic_data_service
 
 
 @pytest.fixture()
@@ -230,3 +232,114 @@ def test_supported_table_status_covers_all_current_business_tables():
         "employee_permissions",
         "product_vendor_mappings",
     } <= names
+
+
+def test_reflected_demo_orders_uses_generic_faker_without_hardcoded_registration(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata = MetaData()
+    demo_orders = Table(
+        "demo_orders",
+        metadata,
+        Column("order_id", Integer, primary_key=True, autoincrement=True),
+        Column("order_number", String, nullable=False),
+        Column("customer_name", String, nullable=False),
+        Column("product_name", String, nullable=False),
+        Column("quantity", Integer, nullable=False),
+        Column("total_amount", Numeric, nullable=False),
+        Column("status", String, nullable=False),
+        Column("created_at", DateTime, server_default=func.current_timestamp()),
+    )
+    metadata.create_all(engine)
+
+    monkeypatch.setattr(synthetic_data_service, "get_public_table_names", lambda: ["demo_orders", "sessions"])
+    monkeypatch.setattr(
+        synthetic_data_service,
+        "get_runtime_table",
+        lambda table_name, bind=None: demo_orders if table_name == "demo_orders" else (_ for _ in ()).throw(KeyError(table_name)),
+    )
+
+    request = parse_synthetic_data_prompt("Generate 5 synthetic demo_orders")
+    assert request is not None
+    assert request.target_table == "demo_orders"
+
+    with Session(engine) as session:
+        batch = generate_synthetic_records(session, request)
+
+    assert len(batch.records) == 5
+    assert batch.metadata["generator_mode"] == "schema_fallback_reflected_postgresql"
+    assert batch.metadata["supported_tables"] == ["demo_orders"]
+    assert all("order_id" not in record for record in batch.records)
+    assert all("created_at" not in record for record in batch.records)
+    assert all(
+        {"order_number", "customer_name", "product_name", "quantity", "total_amount", "status"} <= set(record)
+        for record in batch.records
+    )
+
+
+def test_reflected_short_unique_business_key_keeps_distinct_suffixes(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata = MetaData()
+    orders = Table(
+        "orders",
+        metadata,
+        Column("order_id", Integer, primary_key=True, autoincrement=True),
+        Column("order_number", String(8), nullable=False, unique=True),
+        Column("customer_name", String(50), nullable=False),
+        Column("quantity", Integer, nullable=False),
+    )
+    metadata.create_all(engine)
+
+    monkeypatch.setattr(synthetic_data_service, "get_public_table_names", lambda: ["orders"])
+    monkeypatch.setattr(
+        synthetic_data_service,
+        "get_runtime_table",
+        lambda table_name, bind=None: orders if table_name == "orders" else (_ for _ in ()).throw(KeyError(table_name)),
+    )
+
+    request = parse_synthetic_data_prompt("Insert 5 synthetic records into orders table")
+    assert request is not None
+    with Session(engine) as session:
+        batch = generate_synthetic_records(session, request)
+        collisions = find_batch_duplicates("orders", batch.records, session)
+
+    keys = [record["order_number"] for record in batch.records]
+    assert len(keys) == len(set(keys)) == 5
+    assert all(len(value) <= 8 for value in keys)
+    assert collisions == []
+
+
+def test_reflected_singleton_unique_integer_is_distinct(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata = MetaData()
+    allocations = Table(
+        "allocations",
+        metadata,
+        Column("allocation_id", Integer, primary_key=True, autoincrement=True),
+        Column("business_number", Integer, nullable=False, unique=True),
+        Column("label", String(30), nullable=False),
+    )
+    metadata.create_all(engine)
+
+    monkeypatch.setattr(synthetic_data_service, "get_public_table_names", lambda: ["allocations"])
+    monkeypatch.setattr(
+        synthetic_data_service,
+        "get_runtime_table",
+        lambda table_name, bind=None: allocations if table_name == "allocations" else (_ for _ in ()).throw(KeyError(table_name)),
+    )
+
+    request = parse_synthetic_data_prompt("Generate 5 synthetic allocations")
+    assert request is not None
+    with Session(engine) as session:
+        batch = generate_synthetic_records(session, request)
+
+    numbers = [record["business_number"] for record in batch.records]
+    assert len(numbers) == len(set(numbers)) == 5
+
+
+def test_operational_table_is_not_a_synthetic_target(monkeypatch):
+    monkeypatch.setattr(synthetic_data_service, "get_public_table_names", lambda: ["demo_orders", "sessions"])
+
+    names = {item["table_name"] for item in supported_synthetic_tables()}
+    assert "demo_orders" in names
+    assert "sessions" not in names
+    assert parse_synthetic_data_prompt("Generate 2 synthetic sessions") is None

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -72,6 +73,19 @@ class StructuredReadService:
         "sales_deals": ("sales deal", "sales deals"),
     }
 
+    _COUNT_COLUMN_NAMES = {
+        "count",
+        "count(*)",
+        "row_count",
+        "total",
+        "total_count",
+        "employee_count",
+        "vendor_count",
+        "customer_count",
+        "product_count",
+        "sales_deal_count",
+    }
+
     def __init__(self, *, mcp_client: LocalMCPClient | None = None) -> None:
         self._mcp_client = mcp_client or LocalMCPClient()
 
@@ -100,6 +114,23 @@ class StructuredReadService:
             return f"{items[0]} and {items[1]}"
 
         return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+    @staticmethod
+    def _aggregate_count(value: Any) -> int | None:
+        """Normalize a non-negative integral SQL COUNT value."""
+
+        if isinstance(value, bool) or value is None:
+            return None
+
+        try:
+            normalized = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
+            return None
+
+        if not normalized.is_finite() or normalized < 0 or normalized != normalized.to_integral_value():
+            return None
+
+        return int(normalized)
 
     @classmethod
     def _common_row_value(
@@ -229,6 +260,28 @@ class StructuredReadService:
 
         table_name = normalized_tables[0]
         entity_labels = cls._ENTITY_LABELS.get(table_name)
+
+        # COUNT(*) produces one database result row regardless of the number it
+        # counts. Use the aggregate value rather than mistaking len(rows) == 1
+        # for one matching entity.
+        if len(rows) == 1:
+            count_values = [
+                value
+                for key, value in rows[0].items()
+                if str(key).strip().lower() in cls._COUNT_COLUMN_NAMES
+                or str(key).strip().lower().endswith("_count")
+            ]
+            count = cls._aggregate_count(count_values[0]) if len(count_values) == 1 else None
+            if count is not None:
+                if entity_labels is None:
+                    label = "matching record" if count == 1 else "matching records"
+                else:
+                    singular_label, plural_label = entity_labels
+                    label = singular_label if count == 1 else plural_label
+                return (
+                    ResponseStatus.SUCCESS,
+                    f"Found {count} {label} in the current database.",
+                )
 
         if entity_labels is None:
             if row_count == 1:

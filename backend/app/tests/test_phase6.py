@@ -102,6 +102,57 @@ def test_structured_read_returns_controlled_no_data_answer_without_second_llm_ca
     assert result.row_count == 0
 
 
+def test_structured_read_uses_count_value_instead_of_aggregate_result_row_count():
+    fake_client = FakeMCPClient(_mcp_success([{"count": 94}]))
+    service = StructuredReadService(mcp_client=fake_client)
+    count_proposal = SQLGenerationResult(
+        route="structured_read",
+        sql="SELECT COUNT(*) FROM employees",
+        explanation="Count all employees.",
+    )
+    count_validation = SQLValidationResult(
+        is_valid=True,
+        statement_type="SELECT",
+        normalized_sql="SELECT COUNT(*) FROM employees LIMIT 100",
+        tables=["employees"],
+        columns=[],
+        warnings=[],
+        applied_limit=100,
+    )
+
+    with patch(
+        "app.services.structured_read_service.llm_service.generate_sql",
+        return_value=(count_proposal, count_validation, _metadata(), {}),
+    ), patch.object(service, "_write_query_log", return_value={"stored": True}):
+        result = service.execute(
+            question="Count every row in the employees table without applying filters.",
+            request_id="req-count",
+        )
+
+    assert result.status == ResponseStatus.SUCCESS
+    assert result.answer == "Found 94 employees in the current database."
+    assert result.rows == [{"count": 94}]
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"COUNT": 94}, "Found 94 employees in the current database."),
+        ({"total_count": "94"}, "Found 94 employees in the current database."),
+        ({"employee_count": 94.0}, "Found 94 employees in the current database."),
+    ],
+)
+def test_structured_read_normalizes_postgres_count_aliases(row, expected):
+    status, answer = StructuredReadService._grounded_answer(
+        row_count=1,
+        rows=[row],
+        source_tables=["employees"],
+    )
+
+    assert status == ResponseStatus.SUCCESS
+    assert answer == expected
+
+
 def test_structured_read_rejects_unexecuted_tool_result():
     fake_client = FakeMCPClient(
         {

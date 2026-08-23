@@ -37,6 +37,22 @@ _TOOL_CATALOG: list[dict[str, Any]] = [
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 500000},
                 "user_role": {"type": "string"},
+                "filters": {
+                    "type": ["object", "null"],
+                    "description": "Optional reflected-column equality filters. Raw SQL is not accepted.",
+                    "additionalProperties": {"type": ["string", "number", "integer", "boolean", "null"]},
+                },
+                "relationship_filter": {
+                    "type": ["object", "null"],
+                    "description": "Optional direct reflected parent relationship filter; raw JOIN or SQL text is never accepted.",
+                    "properties": {
+                        "parent_table": {"type": "string"},
+                        "parent_column": {"type": "string"},
+                        "parent_value": {"type": ["string", "number", "integer", "boolean", "null"]},
+                    },
+                    "required": ["parent_table", "parent_column", "parent_value"],
+                    "additionalProperties": False,
+                },
             },
             "required": ["table_name"],
             "additionalProperties": False,

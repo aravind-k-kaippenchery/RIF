@@ -396,6 +396,8 @@ def get_table_records_tool(
     limit: int = 50,
     offset: int = 0,
     user_role: str = UserRole.NORMAL_USER.value,
+    filters: dict[str, Any] | None = None,
+    relationship_filter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a bounded page from one approved table; raw SQL is never accepted."""
 
@@ -405,6 +407,8 @@ def get_table_records_tool(
             limit=limit,
             offset=offset,
             user_role=user_role,
+            filters=filters,
+            relationship_filter=relationship_filter,
         )
     except MCPTableAccessError as exc:
         return {"retrieved": False, "error_code": exc.code, "error_message": exc.message}
@@ -570,4 +574,3 @@ def apply_admin_schema_change_tool(
             "error_message": "The restricted admin schema change could not be completed.",
             "raw_sql_accepted": False,
         }
-

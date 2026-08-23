@@ -31,4 +31,12 @@ def test_does_not_invent_a_city_constraint_for_non_location_question():
     )
 
     assert result.is_valid is True
+
+
+def test_table_wording_is_not_misread_as_a_city_filter():
+    result = validate_structured_read_constraints(
+        question="Count every row in the orders table.",
+        sql="SELECT COUNT(*) FROM orders",
+    )
+    assert result.is_valid is True
     assert result.expected_city is None

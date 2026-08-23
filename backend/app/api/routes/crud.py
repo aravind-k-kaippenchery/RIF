@@ -13,7 +13,7 @@ from app.core.request_context import get_request_id
 from app.core.response import ResponseBuilder
 from app.core.security import get_current_role
 from app.db.session import get_db_session
-from app.schemas.phase7 import BulkWriteProposalRequest, PendingActionMutationRequest, PromptWriteProposalRequest, WriteProposalRequest
+from app.schemas.phase7 import BulkWriteProposalRequest, DuplicateCheckRequest, PendingActionMutationRequest, PromptWriteProposalRequest, WriteProposalRequest
 from app.services.crud_write_service import CrudWriteError, crud_write_service
 from app.services.llm_service import LLMOutputValidationError, LLMServiceError, OllamaUnavailableError, llm_service
 
@@ -135,6 +135,34 @@ def propose_bulk_insert(
     return _proposal_response(request, result, answer="Bulk insert preview created after duplicate checks. No database rows were inserted.")
 
 
+@router.post("/check-duplicates", summary="Check reflected PostgreSQL unique keys without creating or changing data")
+def check_duplicates(
+    payload: DuplicateCheckRequest,
+    request: Request,
+    db: Session = Depends(get_db_session),
+    role: UserRole = Depends(get_current_role),
+):
+    del role  # Authentication/role parsing still runs; this endpoint is read-only.
+    try:
+        result = crud_write_service.check_duplicates(
+            db,
+            target_table=payload.target_table,
+            values=payload.values,
+        )
+    except CrudWriteError as exc:
+        _raise_crud_error(exc)
+    return ResponseBuilder.success(
+        request,
+        route=AgentRoute.STRUCTURED_READ,
+        answer=(
+            "A matching record was found for at least one reflected unique key."
+            if result["duplicate_found"]
+            else "No matching record was found for the complete reflected unique keys supplied."
+        ),
+        data=result,
+    )
+
+
 @router.post("/actions/{pending_action_id}/confirm", summary="Execute exactly one stored pending action in one transaction")
 def confirm_write(
     pending_action_id: str,
@@ -218,4 +246,3 @@ def cancel_write(
         data=result,
         pending_action_id=result["pending_action"]["pending_action_id"],
     )
-

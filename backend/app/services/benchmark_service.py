@@ -395,12 +395,13 @@ class BenchmarkService:
 
     def _resource_sample(self, _: DbSession) -> ScenarioOutcome:
         started = perf_counter()
-        process = psutil.Process()
         try:
+            process = psutil.Process()
             process_cpu = process.cpu_percent(interval=0.10)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
+            process = None
             process_cpu = None
-        backend_rss = self._process_memory_mib(process)
+        backend_rss = self._process_memory_mib(process) if process is not None else None
         ollama_rss_values: list[float] = []
         for candidate in psutil.process_iter(["name", "cmdline"]):
             try:

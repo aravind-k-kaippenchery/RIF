@@ -78,7 +78,9 @@ New hardened MCP tools:
 - `create_schema_change_preview` — admin-only `CREATE TABLE` / `ALTER TABLE ADD COLUMN` preview and audit record
 - `apply_admin_schema_change` — confirmation-shaped request that deliberately blocks direct DDL until Phase 13
 
-Operational/audit tables require the temporary `X-User-Role: admin` header for record reads.
+For this trusted local demo, operational/audit tables use the selected admin
+role (`X-User-Role: admin`) without an API key. Do not expose this configuration
+to an untrusted network.
 
 
 ## Phase 13

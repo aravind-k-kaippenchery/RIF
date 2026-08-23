@@ -102,7 +102,9 @@ def get_runtime_table(table_name: str, bind: Any | None = None) -> Table:
 
     if bind is not None:
         metadata = MetaData()
-        return Table(normalized, metadata, autoload_with=bind, schema=PUBLIC_SCHEMA)
+        # SQLite and other test databases do not have PostgreSQL's ``public`` schema.
+        schema = PUBLIC_SCHEMA if bind.dialect.name == "postgresql" else None
+        return Table(normalized, metadata, autoload_with=bind, schema=schema)
 
     try:
         with get_session_factory()() as db:

@@ -13,7 +13,8 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from app.services.schema_registry import BUSINESS_TABLES
+from app.services.dynamic_pgsql_schema import get_public_table_names, get_runtime_table, has_public_table
+from app.services.schema_registry import OPERATIONAL_TABLES
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,112 @@ def _split_person_name(value: str) -> tuple[str, str]:
     return parts[0].title(), " ".join(parts[1:]).title()
 
 
+def _dynamic_target(text: str) -> str | None:
+    """Resolve an explicitly named reflected business table without guessing."""
+
+    lower = text.casefold()
+    aliases: list[tuple[str, str]] = []
+    for table_name in get_public_table_names():
+        if table_name in OPERATIONAL_TABLES:
+            continue
+        readable = table_name.replace("_", " ")
+        candidates = {table_name, readable}
+        if readable.endswith("s") and len(readable) > 1:
+            candidates.add(readable[:-1])
+        for alias in candidates:
+            aliases.append((alias, table_name))
+    for alias, table_name in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
+        if re.search(rf"\b{re.escape(alias)}\b", lower):
+            return table_name
+    return None
+
+
+def _database_generated(column: Any) -> bool:
+    return bool(
+        column.identity is not None
+        or column.computed is not None
+        or column.server_default is not None
+        or column.default is not None
+        or (column.primary_key and column.autoincrement in (True, "auto"))
+    )
+
+
+def _coerce_literal(value: str, column: Any) -> Any:
+    cleaned = value.strip(" \t\r\n,.;!?'\"")
+    lowered = cleaned.casefold()
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        python_type = column.type.python_type
+    except (AttributeError, NotImplementedError):
+        python_type = str
+    if python_type is bool:
+        if lowered in {"true", "yes", "active", "1"}:
+            return True
+        if lowered in {"false", "no", "inactive", "0"}:
+            return False
+    if python_type is int:
+        try:
+            return int(cleaned)
+        except ValueError:
+            return cleaned
+    if python_type is float:
+        try:
+            return float(cleaned)
+        except ValueError:
+            return cleaned
+    return cleaned
+
+
+def _extract_dynamic_record(text: str, table_name: str) -> dict[str, Any] | None:
+    """Parse only explicit ``column value`` pairs for a reflected table.
+
+    Returning ``None`` on incomplete input deliberately hands the request back to the
+    normal validated LLM CRUD path; this parser never invents values for a new schema.
+    """
+
+    with_match = re.search(r"\bwith\b(.+)$", text, flags=re.IGNORECASE)
+    if not with_match:
+        return None
+    try:
+        table = get_runtime_table(table_name)
+    except KeyError:
+        return None
+    segment = with_match.group(1)
+    labels: list[tuple[int, int, Any]] = []
+    for column in table.columns:
+        aliases = sorted({column.name, column.name.replace("_", " ")}, key=len, reverse=True)
+        alias_pattern = "|".join(re.escape(alias) for alias in aliases)
+        match = re.search(
+            rf"(?<![a-zA-Z0-9_])(?:{alias_pattern})(?![a-zA-Z0-9_])\s*(?:is\s+|=\s*|:\s*)?",
+            segment,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            labels.append((match.start(), match.end(), column))
+    labels.sort(key=lambda item: item[0])
+    if not labels:
+        return None
+
+    record: dict[str, Any] = {}
+    for index, (_, value_start, column) in enumerate(labels):
+        value_end = labels[index + 1][0] if index + 1 < len(labels) else len(segment)
+        raw = segment[value_start:value_end]
+        raw = re.sub(r"^[\s,;]*(?:and\s+)?", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"[\s,;]*(?:and)?\s*$", "", raw, flags=re.IGNORECASE)
+        if raw:
+            record[column.name] = _coerce_literal(raw, column)
+
+    required = {
+        column.name
+        for column in table.columns
+        if not column.nullable and not _database_generated(column)
+    }
+    if not required.issubset({key for key, value in record.items() if value not in (None, "")}):
+        return None
+    return record
+
+
 def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
     text = _normalize(question)
     if not text:
@@ -121,7 +228,7 @@ def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
     if re.search(r"\b(?:synthetic|random|faker|generate|seed|populate)\b", lower):
         return None
 
-    if "employees" in BUSINESS_TABLES and re.search(r"\bemployees?\b", lower):
+    if has_public_table("employees") and re.search(r"\bemployees?\b", lower):
         name = _extract_name(text, entity="employee")
         email = _extract_email(text)
         if not (name and email):
@@ -140,7 +247,7 @@ def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
         }
         return ExplicitInsertRequest("employees", [record], f"explicit employee insert for {name}")
 
-    if "vendors" in BUSINESS_TABLES and re.search(r"\bvendors?\b", lower):
+    if has_public_table("vendors") and re.search(r"\bvendors?\b", lower):
         name = _extract_name(text, entity="vendor")
         if not name:
             return None
@@ -155,7 +262,7 @@ def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
         }
         return ExplicitInsertRequest("vendors", [record], f"explicit vendor insert for {name}")
 
-    if "customers" in BUSINESS_TABLES and re.search(r"\bcustomers?\b", lower):
+    if has_public_table("customers") and re.search(r"\bcustomers?\b", lower):
         name = _extract_name(text, entity="customer")
         if not name:
             return None
@@ -170,7 +277,7 @@ def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
         }
         return ExplicitInsertRequest("customers", [record], f"explicit customer insert for {name}")
 
-    if "products" in BUSINESS_TABLES and re.search(r"\bproducts?\b", lower):
+    if has_public_table("products") and re.search(r"\bproducts?\b", lower):
         name = _extract_after(text, r"\bproduct\s+name\s+(.+?)(?:,|\s+category\b|\s+list\s+price\b|\s+price\b|\s+and\b|$)") or _extract_name(text, entity="product")
         price = _extract_price(text)
         if not (name and price is not None):
@@ -185,4 +292,14 @@ def detect_explicit_insert(question: str) -> ExplicitInsertRequest | None:
         }
         return ExplicitInsertRequest("products", [record], f"explicit product insert for {name}")
 
-    return None
+    target_table = _dynamic_target(text)
+    if target_table is None:
+        return None
+    record = _extract_dynamic_record(text, target_table)
+    if record is None:
+        return None
+    return ExplicitInsertRequest(
+        target_table,
+        [record],
+        f"explicit reflected-table insert for {target_table}",
+    )

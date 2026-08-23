@@ -12,25 +12,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 from typing import Any
 from uuid import UUID
 
 import sqlglot
 from sqlglot import exp
-from sqlalchemy import select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 
 from app.core.constants import AgentRoute, ResponseStatus, UserRole
 from app.models import Base
 from app.models.operations import ActionLog, ChangeSnapshot, PendingAction
+from app.services.dynamic_pgsql_schema import get_runtime_table, has_public_table
 from app.services.duplicate_service import (
     detect_record_duplicates,
     find_batch_duplicates,
+    get_unique_key_sets,
     json_safe,
     row_to_dict,
 )
-from app.services.schema_registry import BUSINESS_TABLES, get_allowed_columns, get_relationships
+from app.services.schema_registry import OPERATIONAL_TABLES, get_allowed_columns, get_relationships
 from app.services.session_service import (
     _utc_now,
     create_pending_action,
@@ -101,20 +104,26 @@ class CrudWriteService:
     @staticmethod
     def _business_table(table_name: str) -> Any:
         normalized = table_name.strip().lower()
-        if normalized not in BUSINESS_TABLES:
+        if not has_public_table(normalized):
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="unknown_table",
+                message=f"Table '{normalized}' is not available in the reflected PostgreSQL public schema.",
+            )
+        if normalized in OPERATIONAL_TABLES:
             raise CrudWriteError(
                 status=ResponseStatus.VALIDATION_FAILED,
                 code="write_target_not_allowed",
-                message="Phase 7 writes are limited to approved business tables.",
+                message="Operational/audit tables are not valid business write targets.",
             )
-        table = Base.metadata.tables.get(normalized)
-        if table is None:
+        try:
+            return get_runtime_table(normalized)
+        except KeyError as exc:
             raise CrudWriteError(
                 status=ResponseStatus.VALIDATION_FAILED,
                 code="unknown_table",
                 message=f"Table '{normalized}' is not available for controlled writes.",
-            )
-        return table
+            ) from exc
 
     @staticmethod
     def _parse(sql: str) -> exp.Expression:
@@ -211,19 +220,33 @@ class CrudWriteService:
 
     def _validate_records(self, target_table: str, records: list[dict[str, Any]]) -> None:
         table = self._business_table(target_table)
-        allowed = set(get_allowed_columns(target_table)) - MANAGED_COLUMNS
+        audit_managed = {name for name in ("created_at", "updated_at") if name in table.c}
+
+        def database_generated(column: Any) -> bool:
+            try:
+                python_type = column.type.python_type
+            except (AttributeError, NotImplementedError):
+                python_type = None
+            return bool(
+                column.identity is not None
+                or column.computed is not None
+                or (column.primary_key and python_type is int and column.autoincrement in (True, "auto"))
+            )
+
+        generated = {column.name for column in table.columns if database_generated(column)}
+        allowed = {column.name for column in table.columns} - audit_managed - generated
         required = [
             column.name
             for column in table.columns
-            if not column.primary_key
-            and not column.nullable
+            if not column.nullable
+            and column.name not in audit_managed
+            and column.name not in generated
             and column.default is None
             and column.server_default is None
-            and column.name not in MANAGED_COLUMNS
         ]
         for index, record in enumerate(records):
             unknown = sorted(set(record) - allowed)
-            managed = sorted(set(record) & MANAGED_COLUMNS)
+            managed = sorted(set(record) & (audit_managed | generated))
             missing = [name for name in required if record.get(name) in (None, "")]
             if unknown or managed or missing:
                 details = [{"record_index": index, "unknown_columns": unknown, "managed_columns": managed, "missing_required_fields": missing}]
@@ -358,10 +381,21 @@ class CrudWriteService:
         """
 
         table = self._business_table(target_table)
-        ids = [row.get("id") for row in before_rows if row.get("id") is not None]
-        if not ids or "id" not in table.c:
+        primary_keys = list(table.primary_key.columns)
+        if not primary_keys:
             return []
-        statement = select(table).where(table.c.id.in_(ids)).order_by(table.c.id)
+        identities = [
+            {column.name: row[column.name] for column in primary_keys}
+            for row in before_rows
+            if all(row.get(column.name) is not None for column in primary_keys)
+        ]
+        if not identities:
+            return []
+        filters = [
+            and_(*(table.c[name] == value for name, value in identity.items()))
+            for identity in identities
+        ]
+        statement = select(table).where(or_(*filters)).order_by(*primary_keys)
         return [row_to_dict(row) for row in db.execute(statement).mappings().all()]
 
     @staticmethod
@@ -409,25 +443,34 @@ class CrudWriteService:
         protected without another employee-specific branch.
         """
 
-        parent_ids = [row.get("id") for row in parent_rows if row.get("id") is not None]
-        if not parent_ids:
-            return []
         details: list[dict[str, Any]] = []
         for relationship in get_relationships():
             if relationship.get("to_table") != parent_table:
                 continue
-            if str(relationship.get("delete_rule") or "").upper() != "RESTRICT":
+            delete_rule = str(relationship.get("delete_rule") or "NO ACTION").upper()
+            if delete_rule not in {"RESTRICT", "NO ACTION"}:
                 continue
             child_table_name = str(relationship.get("from_table") or "")
             child_column_name = str(relationship.get("from_column") or "")
-            child_table = Base.metadata.tables.get(child_table_name)
-            if child_table is None or child_column_name not in child_table.c:
+            parent_column_name = str(relationship.get("to_column") or "")
+            parent_values = [
+                row.get(parent_column_name)
+                for row in parent_rows
+                if row.get(parent_column_name) is not None
+            ]
+            if not parent_values:
+                continue
+            try:
+                child_table = self._business_table(child_table_name)
+            except CrudWriteError:
+                continue
+            if child_column_name not in child_table.c:
                 continue
             rows = [
                 row_to_dict(row)
                 for row in db.execute(
                     select(child_table)
-                    .where(child_table.c[child_column_name].in_(parent_ids))
+                    .where(child_table.c[child_column_name].in_(parent_values))
                     .limit(MAX_PREVIEW_ROWS + 1)
                 ).mappings().all()
             ]
@@ -436,7 +479,7 @@ class CrudWriteService:
                     {
                         "child_table": child_table_name,
                         "child_foreign_key": child_column_name,
-                        "delete_rule": "RESTRICT",
+                        "delete_rule": delete_rule,
                         "record_count": len(rows),
                         "records": rows[:MAX_PREVIEW_ROWS],
                     }
@@ -449,7 +492,7 @@ class CrudWriteService:
         return f"Preview: {action_type.lower()} {affected_count} {noun} in {target_table}. Confirmation is required before execution."
 
     @staticmethod
-    def _record_identities(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _record_identities(records: list[dict[str, Any]], table: Any | None = None) -> list[dict[str, Any]]:
         """Return stable business identifiers for action memory without storing full rows."""
 
         identity_keys = (
@@ -465,9 +508,17 @@ class CrudWriteService:
             "contact_email",
         )
         identities: list[dict[str, Any]] = []
+        primary_keys = list(table.primary_key.columns) if table is not None else []
         for index, record in enumerate(records):
             identity: dict[str, Any] = {}
+            if primary_keys and all(record.get(column.name) is not None for column in primary_keys):
+                identity = {
+                    column.name: json_safe(record[column.name])
+                    for column in primary_keys
+                }
             for key in identity_keys:
+                if identity:
+                    break
                 value = record.get(key)
                 if value not in (None, ""):
                     identity[key] = json_safe(value)
@@ -477,6 +528,44 @@ class CrudWriteService:
                 identity = {"record_index": index}
             identities.append(identity)
         return identities
+
+    def check_duplicates(
+        self,
+        db: DbSession,
+        *,
+        target_table: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run a read-only duplicate check without creating a pending write action."""
+
+        normalized = target_table.strip().lower()
+        table = self._business_table(normalized)
+        unknown = sorted(set(values) - {column.name for column in table.columns})
+        if unknown:
+            raise CrudWriteError(
+                status=ResponseStatus.VALIDATION_FAILED,
+                code="duplicate_check_unknown_columns",
+                message="Duplicate-check values contain columns that are not present in the reflected table.",
+                details=[{"target_table": normalized, "unknown_columns": unknown}],
+            )
+        key_sets = get_unique_key_sets(db, normalized)
+        checked_keys = [
+            list(keys)
+            for keys in key_sets
+            if all(values.get(key) not in (None, "") for key in keys)
+        ]
+        matches = [
+            match.to_dict()
+            for match in detect_record_duplicates(db, table_name=normalized, values=values)
+        ]
+        return {
+            "target_table": normalized,
+            "checked_key_sets": checked_keys,
+            "duplicate_matches": matches,
+            "duplicate_found": bool(matches),
+            "write_execution_allowed": False,
+            "schema_source": "postgresql_reflection",
+        }
 
     def propose_sql_write(
         self,
@@ -513,7 +602,7 @@ class CrudWriteService:
 
         if statement_type == "INSERT":
             records = self._insert_records_from_sql(expression, target_table)
-            batch_duplicates = find_batch_duplicates(target_table, records)
+            batch_duplicates = find_batch_duplicates(target_table, records, db)
             if batch_duplicates:
                 raise CrudWriteError(
                     status=ResponseStatus.DUPLICATE_DETECTED,
@@ -638,7 +727,7 @@ class CrudWriteService:
                 "count_verified": True,
             }
         )
-        inside_batch = find_batch_duplicates(target_table, records)
+        inside_batch = find_batch_duplicates(target_table, records, db)
         if inside_batch:
             raise CrudWriteError(
                 status=ResponseStatus.DUPLICATE_DETECTED,
@@ -829,7 +918,12 @@ class CrudWriteService:
 
     @staticmethod
     def _snapshot(db: DbSession, *, action_log_id: int, table_name: str, record: dict[str, Any], snapshot_type: str) -> None:
-        record_id = str(record.get("id") or record.get("employee_code") or record.get("vendor_code") or record.get("customer_code") or record.get("product_code") or record.get("deal_code") or "unknown")
+        try:
+            table = CrudWriteService._business_table(table_name)
+        except CrudWriteError:
+            table = None
+        identity = CrudWriteService._record_identities([record], table)[0]
+        record_id = json.dumps(identity, sort_keys=True, default=str)
         db.add(
             ChangeSnapshot(
                 action_log_id=action_log_id,
@@ -929,7 +1023,8 @@ class CrudWriteService:
                 .order_by(ActionLog.created_at.desc())
             )
             affected = existing_log.affected_record_ids if existing_log and isinstance(existing_log.affected_record_ids, dict) else {}
-            identities = affected.get("record_ids") if isinstance(affected.get("record_ids"), list) else self._record_identities(records)
+            existing_table = self._business_table(str(action.target_table or ""))
+            identities = affected.get("record_ids") if isinstance(affected.get("record_ids"), list) else self._record_identities(records, existing_table)
             generation_metadata = payload.get("generation_metadata") if isinstance(payload.get("generation_metadata"), dict) else {}
             count_contract = payload.get("count_contract") if isinstance(payload.get("count_contract"), dict) else {}
             expected_count = self._expected_bulk_count(records, generation_metadata=generation_metadata, count_contract=count_contract) if records else None
@@ -1161,7 +1256,7 @@ class CrudWriteService:
             action.confirmed_at = _utc_now()
             action_log.status = "success"
             affected_records = after_rows if after_rows else before_rows
-            affected_record_ids = self._record_identities(affected_records)
+            affected_record_ids = self._record_identities(affected_records, table)
             action_log.affected_record_ids = {
                 "affected_row_count": affected_count,
                 "before_snapshot_count": len(before_rows),
@@ -1248,37 +1343,3 @@ class CrudWriteService:
 
 
 crud_write_service = CrudWriteService()
-
-
-# BEGIN RIF FULL PGSQL CRUD OVERRIDE
-# Runtime PostgreSQL reflection override: confirmation-gated CRUD can target reflected public data tables.
-from app.services.dynamic_pgsql_schema import get_runtime_table as _rif_get_runtime_table, has_public_table as _rif_has_public_table
-from app.services.schema_registry import OPERATIONAL_TABLES as _rif_operational_tables
-
-
-def _rif_dynamic_business_table(table_name: str) -> Any:
-    normalized = str(table_name or "").strip().lower()
-    if not _rif_has_public_table(normalized):
-        raise CrudWriteError(
-            status=ResponseStatus.VALIDATION_FAILED,
-            code="unknown_table",
-            message=f"Table '{normalized}' is not available in the reflected PostgreSQL public schema.",
-        )
-    if normalized in _rif_operational_tables:
-        raise CrudWriteError(
-            status=ResponseStatus.VALIDATION_FAILED,
-            code="write_target_not_allowed",
-            message="Operational/audit tables are not valid business write targets.",
-        )
-    try:
-        return _rif_get_runtime_table(normalized)
-    except KeyError as exc:
-        raise CrudWriteError(
-            status=ResponseStatus.VALIDATION_FAILED,
-            code="unknown_table",
-            message=f"Table '{normalized}' is not available for controlled writes.",
-        ) from exc
-
-
-CrudWriteService._business_table = staticmethod(_rif_dynamic_business_table)
-# END RIF FULL PGSQL CRUD OVERRIDE

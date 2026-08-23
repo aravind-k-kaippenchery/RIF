@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
-from app.services.schema_registry import BUSINESS_TABLES
+from app.services.dynamic_pgsql_schema import clear_reflection_cache, get_public_table_names
+from app.services.schema_registry import OPERATIONAL_TABLES
 
 
 _WRITE_VERBS = {
@@ -98,8 +99,8 @@ _DOCUMENT_TERMS = {
 _REFERENCE_TERMS = {"it", "them", "those", "that", "one", "ones", "previous", "last", "new"}
 _GENERIC_DATA_TERMS = {"data", "record", "records", "row", "rows", "table", "tables", "entry", "entries"}
 
-# Deliberately explicit.  A future table must be approved in BUSINESS_TABLES before it
-# can be resolved here or sent to Faker/SQL generation.
+# Friendly aliases for the original application tables. Newly created public business
+# tables are resolved from live PostgreSQL metadata below.
 _TABLE_ALIASES: dict[str, tuple[str, ...]] = {
     "employee_experiences": (
         "employee experiences", "employee experience", "work history", "employment history",
@@ -185,6 +186,27 @@ def _phrase_pattern(value: str) -> str:
     return r"[\s_-]+".join(parts)
 
 
+def _available_business_tables() -> list[str]:
+    """Return live public data tables while excluding operational/audit storage."""
+
+    operational = set(OPERATIONAL_TABLES)
+    try:
+        clear_reflection_cache()
+        reflected = [name for name in get_public_table_names() if name not in operational]
+    except Exception:
+        reflected = []
+    return reflected
+
+
+def _table_aliases(table_name: str) -> set[str]:
+    aliases = set(_TABLE_ALIASES.get(table_name, ()))
+    aliases.update({table_name, table_name.replace("_", " ")})
+    readable = table_name.replace("_", " ")
+    if readable.endswith("s") and len(readable) > 3:
+        aliases.add(readable[:-1])
+    return aliases
+
+
 def resolve_business_tables(question: str) -> tuple[str, ...]:
     """Resolve only explicitly mentioned approved business tables.
 
@@ -195,11 +217,20 @@ def resolve_business_tables(question: str) -> tuple[str, ...]:
     normalized = " ".join(question.casefold().split())
     matched: list[str] = []
 
+    available_tables = _available_business_tables()
+    suffix_counts: dict[str, int] = {}
+    for table_name in available_tables:
+        suffix = table_name.rsplit("_", 1)[-1]
+        suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+
     candidates: list[tuple[int, str, str]] = []
-    for table_name in BUSINESS_TABLES:
-        aliases = set(_TABLE_ALIASES.get(table_name, ()))
-        aliases.add(table_name)
-        aliases.add(table_name.replace("_", " "))
+    for table_name in available_tables:
+        aliases = _table_aliases(table_name)
+        suffix = table_name.rsplit("_", 1)[-1]
+        # "orders" may safely identify "demo_orders" only when no other exposed
+        # business table has the same suffix. Exact names always remain supported.
+        if "_" in table_name and suffix_counts.get(suffix) == 1:
+            aliases.add(suffix)
         for alias in aliases:
             candidates.append((len(alias), table_name, alias))
 
@@ -229,8 +260,9 @@ def _explicit_unknown_table(question: str) -> str | None:
         r"\btable\s+(?:named\s+|called\s+)?([a-z][a-z0-9_-]*)\b",
     )
     ignored = {"a", "an", "the", "new", "random", "synthetic", "one", "existing"}
-    approved_words = {table.casefold() for table in BUSINESS_TABLES}
-    approved_words |= {table.replace("_", " ").casefold() for table in BUSINESS_TABLES}
+    available_tables = _available_business_tables()
+    approved_words = {table.casefold() for table in available_tables}
+    approved_words |= {table.replace("_", " ").casefold() for table in available_tables}
     for pattern in patterns:
         match = re.search(pattern, normalized)
         if not match:
@@ -369,6 +401,7 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
 
     if has_write and has_generation:
         if not resolved_tables:
+            available_tables = _available_business_tables()
             unknown = _explicit_unknown_table(normalized)
             if unknown:
                 message = (
@@ -378,7 +411,7 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
             else:
                 message = (
                     "Which existing business table should receive the synthetic records? "
-                    f"Available targets are: {', '.join(BUSINESS_TABLES)}."
+                    f"Available targets are: {', '.join(available_tables)}."
                 )
             return ClarificationDecision(
                 True,
@@ -386,13 +419,14 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
                 message=message,
                 missing_fields=("target_table",),
                 detected_intent="synthetic_generation",
-                details=[{"approved_business_tables": list(BUSINESS_TABLES)}],
+                details=[{"approved_business_tables": available_tables}],
             )
         # Synthetic generation has its own deterministic count/relationship validation.
         return ClarificationDecision(False, resolved_tables=(resolved_tables[0],), detected_intent="synthetic_generation")
 
     if has_write:
         if not resolved_tables:
+            available_tables = _available_business_tables()
             unknown = _explicit_unknown_table(normalized)
             message = (
                 f"The table '{unknown}' is not an approved business table. Please specify an approved existing table."
@@ -405,7 +439,7 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
                 message=message,
                 missing_fields=("target_table",),
                 detected_intent="crud_write",
-                details=[{"approved_business_tables": list(BUSINESS_TABLES)}],
+                details=[{"approved_business_tables": available_tables}],
             )
 
         if tokens & {"delete", "remove"} and not _has_record_selector(normalized):
@@ -472,9 +506,12 @@ def analyze_request_clarity(question: str) -> ClarificationDecision:
 
     if has_read:
         return ClarificationDecision(
-            False,
+            True,
+            code="read_target_required",
+            message="What would you like to see? Please name a table, record set, or uploaded document.",
+            missing_fields=("target_table_or_document",),
             resolved_tables=resolved_tables,
-            detected_intent="document_question",
+            detected_intent="structured_read",
         )
 
     return ClarificationDecision(

@@ -28,7 +28,6 @@ from app.schemas.phase13 import AdminSchemaProposalResult
 from app.services.business_glossary import normalize_business_text
 from app.services.query_constraint_guard import validate_structured_read_constraints
 from app.services.schema_registry import (
-    BUSINESS_TABLES,
     get_allowed_columns,
     get_allowed_tables,
     get_relationships,
@@ -435,9 +434,17 @@ class LLMService:
         names, column names, primary keys, and join relationships only.
         """
 
+        reflected_contract = get_schema_contract()
+        reflected_tables = [
+            table
+            for table in reflected_contract.get("tables", [])
+            if table.get("category") == "business" and table.get("allowed_for_llm", True)
+        ]
+        business_table_names = [str(table["table_name"]) for table in reflected_tables]
+
         tables: list[dict[str, Any]] = []
-        for table_name in BUSINESS_TABLES:
-            table_schema = get_table_schema(table_name)
+        for table_schema in reflected_tables:
+            table_name = str(table_schema["table_name"])
             tables.append(
                 {
                     "table_name": table_name,
@@ -448,41 +455,37 @@ class LLMService:
 
         relationships = [
             relationship
-            for relationship in get_relationships()
-            if relationship["from_table"] in BUSINESS_TABLES
-            and relationship["to_table"] in BUSINESS_TABLES
+            for relationship in reflected_contract.get("relationships", [])
+            if relationship["from_table"] in business_table_names
+            and relationship["to_table"] in business_table_names
         ]
+        parent_child_relationships = [
+            {
+                "parent_table": relationship["to_table"],
+                "child_table": relationship["from_table"],
+                "parent_key": f"{relationship['to_table']}.{relationship['to_column']}",
+                "child_key": f"{relationship['from_table']}.{relationship['from_column']}",
+                "cardinality": "one_to_zero_or_many",
+                "delete_rule": relationship.get("delete_rule"),
+            }
+            for relationship in relationships
+        ]
+        feature_17 = next(
+            (
+                feature
+                for feature in parent_child_relationships
+                if feature["parent_table"] == "employees"
+                and feature["child_table"] == "employee_permissions"
+            ),
+            None,
+        )
         return {
-            "schema_source": "controlled_compact_business_schema",
-            "business_tables": list(BUSINESS_TABLES),
+            "schema_source": "controlled_compact_business_schema_postgresql_reflection",
+            "business_tables": business_table_names,
             "tables": tables,
             "relationships": relationships,
-            "parent_child_relationships": [
-                {
-                    "parent_table": "employees",
-                    "child_table": "employee_permissions",
-                    "parent_key": "employees.id",
-                    "child_key": "employee_permissions.employee_id",
-                    "cardinality": "one_to_zero_or_many",
-                    "delete_rule": "RESTRICT",
-                },
-                {
-                    "parent_table": "employees",
-                    "child_table": "employee_experiences",
-                    "parent_key": "employees.id",
-                    "child_key": "employee_experiences.employee_id",
-                    "cardinality": "one_to_zero_or_many",
-                    "delete_rule": "RESTRICT",
-                },
-            ],
-            "feature_17": {
-                "parent_table": "employees",
-                "child_table": "employee_permissions",
-                "parent_key": "employees.id",
-                "child_key": "employee_permissions.employee_id",
-                "cardinality": "one_to_zero_or_many",
-                "delete_rule": "RESTRICT",
-            },
+            "parent_child_relationships": parent_child_relationships,
+            "feature_17": feature_17,
         }
 
     @staticmethod
@@ -515,7 +518,11 @@ class LLMService:
             return sql
 
         table_name = match.group("table").lower()
-        if table_name not in BUSINESS_TABLES:
+        try:
+            table_schema = get_table_schema(table_name)
+        except KeyError:
+            return sql
+        if table_schema.get("category") != "business" or not table_schema.get("allowed_for_llm", True):
             return sql
 
         excluded_columns = {"id", "created_at", "updated_at"}
@@ -727,6 +734,29 @@ class LLMService:
             )
         allowed_references = {item["reference"] for item in evidence}
 
+        def answer_is_extractive(answer: str, references: list[str]) -> bool:
+            """Ensure generated facts occur verbatim in their cited evidence.
+
+            Validating a source ID alone is insufficient because a model can cite a
+            real source while inventing a value. Whitespace and case are ignored, but
+            the model may not add or reorder factual words or numbers.
+            """
+
+            normalized_sources = [
+                re.sub(r"\s+", " ", item["content"]).strip().casefold()
+                for item in evidence
+                if item["reference"] in references
+            ]
+            sentences = [
+                re.sub(r"\s+", " ", sentence).strip().casefold()
+                for sentence in re.split(r"(?<=[.!?])\s+|\n+", answer)
+                if sentence.strip()
+            ]
+            return bool(sentences) and all(
+                any(sentence in source for source in normalized_sources)
+                for sentence in sentences
+            )
+
         def semantic_validator(output: BaseModel) -> tuple[bool, str]:
             result = GroundedAnswerResult.model_validate(output)
             if not result.supported:
@@ -740,6 +770,8 @@ class LLMService:
             unknown = sorted(set(result.source_references) - allowed_references)
             if unknown:
                 return False, f"source_references contains unknown source(s): {', '.join(unknown)}."
+            if not answer_is_extractive(result.answer, result.source_references):
+                return False, "Every answer sentence must be copied from one of its cited evidence records."
             return True, ""
 
         return self.generate_json(

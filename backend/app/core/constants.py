@@ -18,6 +18,7 @@ class ResponseStatus(str, Enum):
     RETRIEVAL_FAILED = "retrieval_failed"
     LLM_UNAVAILABLE = "llm_unavailable"
     DATABASE_UNAVAILABLE = "database_unavailable"
+    SENSITIVE_DATA_BLOCKED = "sensitive_data_blocked"
 
 
 class AgentRoute(str, Enum):

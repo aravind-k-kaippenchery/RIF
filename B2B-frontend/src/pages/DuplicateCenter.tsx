@@ -1,64 +1,60 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Check, Copy, LoaderCircle, ShieldAlert } from 'lucide-react';
 import { api } from '../lib/api';
 import type { ApiEnvelope, LocalUser } from '../lib/types';
-import { SectionHeading, StatusBadge, asRecord, SESSION_STORAGE_KEY } from '../App';
+import { SectionHeading, StatusBadge, asRecord } from '../App';
 import type { Toast } from '../App';
 
 type Props = { user: LocalUser; toast: (message: string, type?: Toast['type']) => void };
 
-// Mirrors the backend's advisory unique-key sets (app/services/duplicate_service.py).
-// PostgreSQL unique constraints remain the final source of truth at confirmation time;
-// this form only helps you fill in the fields the backend actually checks.
-const UNIQUE_KEY_SETS: Record<string, string[][]> = {
-  employees: [['employee_code'], ['email'], ['phone']],
-  employee_permissions: [['employee_id', 'permission_code']],
-  vendors: [['vendor_code'], ['vendor_name'], ['contact_email'], ['phone']],
-  customers: [['customer_code'], ['customer_name'], ['contact_email'], ['phone']],
-  products: [['product_code'], ['product_name']],
-  product_vendor_mappings: [['product_id', 'vendor_id']],
-  sales_deals: [['deal_code']],
+type TableCapability = {
+  table_name: string;
+  category: string;
+  unique_constraints?: Array<{ name?: string | null; columns: string[] }>;
 };
 
-const TABLES = Object.keys(UNIQUE_KEY_SETS);
-
 export default function DuplicateCenterPage({ user, toast }: Props) {
-  const [table, setTable] = useState(TABLES[0]);
+  const [tables, setTables] = useState<TableCapability[]>([]);
+  const [table, setTable] = useState('');
   const [values, setValues] = useState<Record<string, string>>({});
+  const [loadingTables, setLoadingTables] = useState(true);
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<ApiEnvelope<any> | null>(null);
 
-  const fields = Array.from(new Set(UNIQUE_KEY_SETS[table].flat()));
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await api.get('/api/tables', user.role);
+        const reflected = ((response.data?.tables || []) as TableCapability[])
+          .filter((entry) => entry.category === 'business' && (entry.unique_constraints || []).length > 0);
+        setTables(reflected);
+        setTable((current) => current || reflected[0]?.table_name || '');
+      } catch (error) {
+        toast(error instanceof Error ? error.message : 'Could not load reflected unique constraints.', 'error');
+      } finally {
+        setLoadingTables(false);
+      }
+    })();
+  }, [user.role]);
 
-  const bootstrapSession = async () => {
-    const existing = sessionStorage.getItem(SESSION_STORAGE_KEY);
-    if (existing) return existing;
-    const response = await api.post('/api/sessions', user.role, { ttl_minutes: 15 });
-    const id = String(response.data?.session_id || response.data?.id);
-    sessionStorage.setItem(SESSION_STORAGE_KEY, id);
-    return id;
-  };
+  const uniqueKeySets = useMemo(
+    () => tables.find((entry) => entry.table_name === table)?.unique_constraints?.map((item) => item.columns) || [],
+    [table, tables],
+  );
+  const fields = useMemo(() => Array.from(new Set(uniqueKeySets.flat())), [uniqueKeySets]);
+  const completeKeySets = uniqueKeySets.filter((keys) => keys.every((field) => values[field]?.trim()));
 
   const check = async (event: FormEvent) => {
     event.preventDefault();
     setChecking(true);
     setResult(null);
     try {
-      const sessionId = await bootstrapSession();
       const record = Object.fromEntries(Object.entries(values).filter(([, value]) => value.trim() !== ''));
-      const response = await api.post('/api/crud/bulk-propose', user.role, {
-        session_id: sessionId,
+      const response = await api.post('/api/crud/check-duplicates', user.role, {
         target_table: table,
-        records: [record],
-        user_prompt: `Duplicate detection check for ${table}`,
-        ttl_minutes: 5,
+        values: record,
       });
       setResult(response);
-      // This workspace only checks for duplicates; it never writes data, so the
-      // preview it creates is cancelled immediately after we read the result.
-      if (response.pending_action_id) {
-        try { await api.post(`/api/crud/actions/${response.pending_action_id}/cancel`, user.role, { session_id: sessionId }); } catch { /* best-effort cleanup */ }
-      }
     } catch (e) {
       toast(e instanceof Error ? e.message : 'The duplicate check could not be completed.', 'error');
     } finally {
@@ -68,7 +64,6 @@ export default function DuplicateCenterPage({ user, toast }: Props) {
 
   const data = asRecord(result?.data);
   const duplicates = (data.duplicate_matches || []) as any[];
-  const checkedFields = fields.filter((field) => values[field]?.trim());
 
   return (
     <div className="workflow-page page-enter">
@@ -77,31 +72,32 @@ export default function DuplicateCenterPage({ user, toast }: Props) {
         <div className="workflow-hero-inner">
           <div className="eyebrow compact"><i /> ADVISORY SAFETY CHECK</div>
           <h2>Check before you <em>propose.</em></h2>
-          <p>Enter candidate field values for a business table and see which existing records already match a known unique business key. This never writes data — any preview it creates is cancelled automatically after the check.</p>
+          <p>Enter candidate field values for a business table and see which existing records match a live PostgreSQL unique constraint. This is a read-only check and never creates a pending write.</p>
         </div>
       </section>
 
       <section className="surface-card crud-form-card">
         <SectionHeading title="Candidate record" eyebrow="ADVISORY · POSTGRESQL REMAINS FINAL PROTECTION" />
         <div className="mode-row">
-          {TABLES.map((name) => (
-            <button key={name} className={`mode-button ${table === name ? 'selected' : ''}`} onClick={() => { setTable(name); setValues({}); setResult(null); }}>{name}</button>
+          {tables.map((entry) => (
+            <button key={entry.table_name} className={`mode-button ${table === entry.table_name ? 'selected' : ''}`} onClick={() => { setTable(entry.table_name); setValues({}); setResult(null); }}>{entry.table_name}</button>
           ))}
         </div>
+        {!loadingTables && !tables.length && <div className="inline-alert">No reflected business table currently has a unique constraint to check.</div>}
         <form className="crud-form" onSubmit={check}>
           {fields.map((field) => (
             <input key={field} value={values[field] || ''} onChange={(event) => setValues((current) => ({ ...current, [field]: event.target.value }))} placeholder={field.replace(/_/g, ' ')} />
           ))}
-          <button className="button primary" disabled={checking || !checkedFields.length}>{checking ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />} {checking ? 'Checking…' : 'Check for duplicates'}</button>
+          <button className="button primary" disabled={checking || !completeKeySets.length}>{checking ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />} {checking ? 'Checking…' : 'Check for duplicates'}</button>
         </form>
         <div className="duplicate-key-hint">
-          {UNIQUE_KEY_SETS[table].map((set, index) => <span key={index}>{set.join(' + ')}</span>)}
+          {uniqueKeySets.map((set, index) => <span key={index}>{set.join(' + ')}</span>)}
         </div>
       </section>
 
       {result && (
         <section className="surface-card">
-          <SectionHeading title="Result" eyebrow="PREVIEW WAS CANCELLED · NO DATA CHANGED" action={<StatusBadge status={duplicates.length ? 'Duplicate detected' : 'Clear'} />} />
+          <SectionHeading title="Result" eyebrow="READ-ONLY CHECK · NO DATA CHANGED" action={<StatusBadge status={duplicates.length ? 'Duplicate detected' : 'Clear'} />} />
           {duplicates.length ? (
             <div className="duplicate-panel">
               <div className="duplicate-panel-head"><ShieldAlert size={18} /><b>{duplicates.length} matching unique key(s) found</b></div>
@@ -121,7 +117,7 @@ export default function DuplicateCenterPage({ user, toast }: Props) {
 
       <section className="surface-card">
         <SectionHeading title="How this works" eyebrow="TRANSPARENCY" />
-        <p className="settings-copy">Duplicate checks run through the same confirmation-gated write pipeline used everywhere else (<code>/api/crud/bulk-propose</code>). A field combination is only tested once every field in that combination is filled in. The stored preview this creates is cancelled immediately so nothing here can ever change business data — PostgreSQL's own unique constraints remain the final, concurrency-safe protection at confirmation time.</p>
+        <p className="settings-copy">The table list and key combinations come from live PostgreSQL reflection. The read-only <code>/api/crud/check-duplicates</code> endpoint tests a combination only after every field in that unique constraint is filled. PostgreSQL's constraint remains the final concurrency-safe protection when a confirmed write executes.</p>
       </section>
     </div>
   );

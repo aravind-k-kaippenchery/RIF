@@ -22,8 +22,12 @@ MAX_MEMORY_EVENTS = 6
 
 
 _CONTEXT_REFERENCE_PATTERNS = (
-    re.compile(r"\b(?:it|them|those|that|these|this|previous|last|latest|earlier|above)\b", re.I),
+    re.compile(r"\b(?:it|them|those|that|these|this|ones|they|previous|last|latest|earlier|above)\b", re.I),
     re.compile(r"\b(?:same|again|continue|what about|as before|like before)\b", re.I),
+    # Existential and implicit-list follow-ups do not contain a pronoun, but still
+    # depend on the immediately preceding successful table result.
+    re.compile(r"\bhow\s+many\s+(?:are|were)\s+there\b", re.I),
+    re.compile(r"\b(?:who\s+are\s+)?(?:the\s+)?first\s+(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)\b", re.I),
 )
 
 
@@ -174,6 +178,11 @@ def build_memory_context(db: DbSession, *, session_id: UUID, limit: int = MAX_ME
                 "route": event.get("route"),
                 "status": event.get("status"),
                 "generated_sql": event.get("generated_sql"),
+                "conversation_reference": (
+                    event.get("source_references", {}).get("conversation_reference")
+                    if isinstance(event.get("source_references"), dict)
+                    else None
+                ),
             }
         )
     return {
@@ -220,7 +229,8 @@ def write_agent_memory_event(
     try:
         existing = db.scalar(select(QueryLog).where(QueryLog.request_id == request_id))
         if existing is not None:
-            existing_references = existing.source_references if isinstance(existing.source_references, dict) else {}
+            # Assign a new mapping so SQLAlchemy reliably detects the JSONB change.
+            existing_references = dict(existing.source_references) if isinstance(existing.source_references, dict) else {}
             existing_references.update(source_payload)
             existing.source_references = existing_references
             if existing.session_id is None:

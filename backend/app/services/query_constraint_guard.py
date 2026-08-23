@@ -62,6 +62,17 @@ _NON_LOCATION_TERMS = {
     "office",
 }
 
+_DATA_CONTEXT_TERMS = {
+    "table",
+    "tables",
+    "row",
+    "rows",
+    "record",
+    "records",
+    "database",
+    "schema",
+}
+
 
 def _normalize(value: str) -> str:
     return " ".join(value.casefold().strip().split())
@@ -81,7 +92,7 @@ def _extract_explicit_city(question: str) -> str | None:
         if not words or len(words) > 3:
             continue
         normalized = _normalize(candidate)
-        if normalized in _NON_LOCATION_TERMS:
+        if normalized in _NON_LOCATION_TERMS or any(word.casefold() in _DATA_CONTEXT_TERMS for word in words):
             continue
         return candidate
     return None

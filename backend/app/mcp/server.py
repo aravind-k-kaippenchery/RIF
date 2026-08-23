@@ -182,6 +182,8 @@ def get_table_records(
     limit: int = 50,
     offset: int = 0,
     user_role: str = "normal_user",
+    filters: dict[str, Any] | None = None,
+    relationship_filter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read one bounded page from an approved table. Raw SQL is not accepted."""
 
@@ -190,6 +192,8 @@ def get_table_records(
         limit=limit,
         offset=offset,
         user_role=user_role,
+        filters=filters,
+        relationship_filter=relationship_filter,
     )
 
 

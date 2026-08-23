@@ -16,7 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.constants import ResponseStatus, UserRole
-from app.services.schema_registry import BUSINESS_TABLES, OPERATIONAL_TABLES, get_allowed_tables, get_relationships
+from app.services.schema_registry import OPERATIONAL_TABLES, get_allowed_tables, get_relationships
 
 
 SchemaQuestionKind = Literal["list_tables", "table_exists", "list_columns", "column_exists", "primary_keys", "required_columns", "relationships"]
@@ -315,7 +315,7 @@ def _visible_tables(role: UserRole) -> list[str]:
     allowed = get_allowed_tables()
     if role == UserRole.ADMIN:
         return allowed
-    return [table for table in BUSINESS_TABLES if table in allowed]
+    return [table for table in allowed if table not in OPERATIONAL_TABLES]
 
 
 def answer_schema_metadata_question(

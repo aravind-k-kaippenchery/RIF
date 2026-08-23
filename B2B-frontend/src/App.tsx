@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useEffect, useState } from 'react';
+import { FormEvent, ReactNode, useEffect, useRef, useState } from 'react';
 import {
   Activity, AlertTriangle, ArrowRight, BarChart3, Bell, Bot, Boxes, BrainCircuit,
   Check, ChevronDown, ChevronRight, ClipboardList, CloudUpload, Code2,
@@ -487,6 +487,10 @@ function Assistant({ user, toast }: { user: LocalUser; toast: (message: string, 
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(() => sessionStorage.getItem(SESSION_KEY));
+  // Keep an immediately writable copy of the active chat session. React state is
+  // asynchronous, so a quick follow-up could otherwise send the session value
+  // captured by the previous render (often null) and silently start a new chat.
+  const sessionIdRef = useRef<string | null>(sessionId);
   const [selectedResponse, setSelectedResponse] = useState<ApiEnvelope<any> | null>(null);
   const [confirming, setConfirming] = useState<ApiEnvelope<any> | null>(null);
 
@@ -498,12 +502,14 @@ function Assistant({ user, toast }: { user: LocalUser; toast: (message: string, 
     try {
       let response: ApiEnvelope<any>;
       try {
-        response = await api.post('/api/query', user.role, { question: prompt, session_id: sessionId, top_k: 4 });
+        const activeSession = sessionIdRef.current || sessionStorage.getItem(SESSION_KEY);
+        response = await api.post('/api/query', user.role, { question: prompt, session_id: activeSession, top_k: 4 });
       } catch (error) {
         // A backend restart or TTL expiry can leave a stale UUID in sessionStorage.
         // Clear it and retry once so the backend can create a fresh session.
         if (error instanceof ApiError && error.code === 'inactive_or_missing_session') {
           sessionStorage.removeItem(SESSION_KEY);
+          sessionIdRef.current = null;
           setSessionId(null);
           response = await api.post('/api/query', user.role, { question: prompt, session_id: null, top_k: 4 });
           toast('The previous chat session expired. A new session was started.', 'info');
@@ -512,7 +518,12 @@ function Assistant({ user, toast }: { user: LocalUser; toast: (message: string, 
         }
       }
       const nextSession = asRecord(response.data).session?.session_id || response.session_id || null;
-      if (nextSession) { sessionStorage.setItem(SESSION_KEY, String(nextSession)); setSessionId(String(nextSession)); }
+      if (nextSession) {
+        const normalizedSession = String(nextSession);
+        sessionIdRef.current = normalizedSession;
+        sessionStorage.setItem(SESSION_KEY, normalizedSession);
+        setSessionId(normalizedSession);
+      }
       setMessages((list) => [...list, { id: response.request_id || `assistant-${Date.now()}`, from: 'assistant', text: response.answer || 'No answer returned.', response }]);
       setSelectedResponse(response);
     } catch (error) { const message = error instanceof Error ? error.message : 'The assistant request failed.'; setMessages((list) => [...list, { id: `error-${Date.now()}`, from: 'assistant', text: message }]); toast(message, 'error'); }
@@ -734,5 +745,3 @@ function AuditDrawer({ action, detail, user, onClose, toast }: { action: any; de
 function ToastStack({ toasts }: { toasts: Toast[] }) { return <div className="toast-stack">{toasts.map((toast) => <div className={`toast ${toast.type}`} key={toast.id}>{toast.type === 'success' ? <Check size={17} /> : toast.type === 'error' ? <AlertTriangle size={17} /> : <Sparkles size={17} />}<span>{toast.message}</span></div>)}</div>; }
 
 export default App;
-
-
